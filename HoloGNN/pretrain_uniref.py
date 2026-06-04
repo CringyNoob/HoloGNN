@@ -306,8 +306,10 @@ def pretrain(
         protect against Vertex AI preemption during the multi-hour run.
         Final output saves only the backbone for use in fine-tuning.
     """
+    from src.device import get_device, describe_device
     t_global = time.time()
-    device   = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device   = get_device()
+    describe_device(device)          # Blackwell / sm_120 runtime guard
     log.info("=" * 68)
     log.info("  Holo-GNN Unsupervised Pre-Training — MLM on UniRef50")
     log.info(f"  Device     : {device}")

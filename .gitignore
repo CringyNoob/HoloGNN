@@ -25,6 +25,14 @@ HOLOGNN_APP/**/data/
 *.pt
 *.ckpt
 
+# --- App runtime: local SQLite prediction-history DB (regenerated on use) ----
+*.db
+*.sqlite
+*.sqlite3
+
+# --- Evaluation outputs ------------------------------------------------------
+metrics_*.json
+
 # --- Python ------------------------------------------------------------------
 __pycache__/
 *.pyc

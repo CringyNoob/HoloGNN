@@ -13,6 +13,8 @@ import time
 # Custom Modules
 from src.dataset import MegaScaleDataset
 from src.full_model import HoloGNN
+from src.device import describe_device
+from src.metrics import regression_metrics, format_report
 
 # --- CONFIGURATION FOR GTX 1050 Ti ---
 BATCH_SIZE = 4           # Optimized for 4GB VRAM
@@ -27,9 +29,8 @@ MAX_SAMPLES = 200000
 
 def train():
     print("--- 1. INITIALIZING HOLO-GNN ---")
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Hardware: {torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU'}")
-    
+    device = describe_device()
+
     model = HoloGNN().to(device)
     criterion = nn.MSELoss()
     optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
@@ -96,10 +97,26 @@ def train():
             running_loss += loss.item()
             progress_bar.set_postfix({'loss': running_loss / (progress_bar.n + 1)})
         
-        # Validation Loop
         avg_loss = running_loss / len(train_loader)
         print(f"Epoch {epoch+1} Done. Avg Loss: {avg_loss:.4f}")
-        
+
+        # --- Validation: held-out regression metrics (Pearson/Spearman/RMSE/MAE/R2) ---
+        model.eval()
+        val_preds, val_labels = [], []
+        with torch.no_grad():
+            for batch in val_loader:
+                class DataBatch: pass
+                data = DataBatch()
+                data.input_ids = batch['input_ids'].to(device)
+                data.mask = batch['attention_mask'].to(device)
+                data.mechanistic_features = batch['mechanistic_features'].to(device)
+                data.edge_index = None
+                preds = model(data, task="stability").squeeze(-1)
+                val_preds.extend(preds.detach().cpu().tolist())
+                val_labels.extend(batch['label'].tolist())
+        print(format_report(regression_metrics(val_labels, val_preds),
+                            f"Epoch {epoch+1} validation (stability ΔG)"))
+
         # Save checkpoint with a consistent name
         save_name = f"holognn_stability_final.pth"
         torch.save(model.state_dict(), save_name)

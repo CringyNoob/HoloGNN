@@ -33,6 +33,9 @@ from torch.utils.data import Dataset, Sampler
 from transformers import EsmTokenizer
 from Bio.Seq import Seq
 
+# [V6] Reuse the biophysical tables from the heuristics module (stdlib-only).
+from src.heuristics import KD_HYDROPATHY, RESIDUE_VOLUME
+
 
 # =============================================================================
 # V5.0 — True CAI: E. coli K-12 codon usage table
@@ -198,28 +201,55 @@ def _protein_only_mech(protein_seq: str, max_length: int) -> torch.Tensor:
 
 
 # =============================================================================
-# Public API — single inference-time entry point
+# V6 — Expanded protein-only mechanistic channels
+#   Three extra descriptors computable from the amino-acid sequence alone
+#   (no DNA required), enriching the protein-only path (ClinVar, the web UI):
+#     3 = Kyte-Doolittle hydropathy  (normalised to [0, 1])
+#     4 = side-chain volume          (normalised to [0, 1])
+#     5 = helix propensity           (Chou-Fasman P_alpha, normalised to [0, 1])
 # =============================================================================
+# Chou-Fasman alpha-helix propensities P_alpha.
+_HELIX_PROPENSITY = {
+    "A": 1.42, "R": 0.98, "N": 0.67, "D": 1.01, "C": 0.70,
+    "Q": 1.11, "E": 1.51, "G": 0.57, "H": 1.00, "I": 1.08,
+    "L": 1.21, "K": 1.16, "M": 1.45, "F": 1.13, "P": 0.57,
+    "S": 0.77, "T": 0.83, "W": 1.08, "Y": 0.69, "V": 1.06,
+}
+_KD_MIN, _KD_MAX   = -4.5, 4.5      # Kyte-Doolittle range
+_VOL_MAX           = 240.0          # > Trp (227.8 A^3)
+_PA_MIN, _PA_MAX   = 0.57, 1.51     # helix propensity range
+
+
+def _expanded_protein_channels(protein_seq: str, max_length: int) -> torch.Tensor:
+    """Return (max_length, 3) of [hydropathy, volume, helix_propensity] in [0,1]."""
+    feat = torch.zeros(max_length, 3, dtype=torch.float32)
+    L    = min(len(protein_seq), max_length)
+    for i in range(L):
+        aa = protein_seq[i].upper()
+        kd = KD_HYDROPATHY.get(aa, 0.0)
+        vol = RESIDUE_VOLUME.get(aa, 0.0)
+        pa = _HELIX_PROPENSITY.get(aa, 1.0)
+        feat[i, 0] = (kd - _KD_MIN) / (_KD_MAX - _KD_MIN)
+        feat[i, 1] = min(1.0, vol / _VOL_MAX)
+        feat[i, 2] = (pa - _PA_MIN) / (_PA_MAX - _PA_MIN)
+    return feat
+
+
 def mechanistic_features_for_protein(protein_seq: str,
-                                     max_length: int) -> torch.Tensor:
+                                     max_length: int,
+                                     expanded: bool = False) -> torch.Tensor:
     """
-    Public helper that returns the (max_length, 3) mechanistic-feature tensor
-    [mRNA_fold, CAI, Charge] for a *protein-only* input (no DNA available).
+    Public helper for inference: the (max_length, C) mechanistic-feature tensor
+    for a protein-only input (no DNA).  C = 3 (default, V5) or 6 (expanded, V6).
 
-    This is the single, shared code path used by both ``predict.py`` and the
-    HOLOGNN_APP inference wrapper so the features fed to the backbone are
-    guaranteed identical to those seen during training (charge channel active;
-    mRNA_fold / CAI zeroed when codon information is unavailable, exactly as in
-    ClinVarDataset / UniRefDataset).
-
-    Args:
-        protein_seq : single-letter amino-acid string.
-        max_length  : sequence length the backbone was tokenised with.
-
-    Returns:
-        torch.FloatTensor of shape (max_length, 3).
+    Used by both ``predict.py`` and the HOLOGNN_APP inference wrapper so the
+    features fed to the backbone match those seen during training.
     """
-    return _protein_only_mech(protein_seq, max_length)
+    base = _protein_only_mech(protein_seq, max_length)             # (L, 3)
+    if not expanded:
+        return base
+    extra = _expanded_protein_channels(protein_seq, max_length)    # (L, 3)
+    return torch.cat([base, extra], dim=-1)                        # (L, 6)
 
 
 # =============================================================================
@@ -308,9 +338,11 @@ class MegaScaleDataset(Dataset):
     Accepts both raw .csv and pre-cleaned .parquet files.
     """
 
-    def __init__(self, data_path: str, max_length: int = 100):
-        self.tokenizer  = _get_tokenizer()
-        self.max_length = max_length
+    def __init__(self, data_path: str, max_length: int = 100,
+                 expanded_mech: bool = False):
+        self.tokenizer     = _get_tokenizer()
+        self.max_length    = max_length
+        self.expanded_mech = expanded_mech   # [V6] append protein-only channels → 6
         path = Path(data_path)
 
         print(f"Loading MegaScale data from {path.name} …")
@@ -338,6 +370,10 @@ class MegaScaleDataset(Dataset):
         label       = float(row[self._label_col])
         tok         = _tokenize(self.tokenizer, protein_seq, self.max_length)
         mech        = _mechanistic_features(protein_seq, dna_seq, self.max_length)
+        if self.expanded_mech:
+            mech = torch.cat(
+                [mech, _expanded_protein_channels(protein_seq, self.max_length)], dim=-1
+            )
         return {
             **tok,
             "label":               torch.tensor(label, dtype=torch.float),
@@ -483,9 +519,11 @@ class FireProtDataset(Dataset):
         self,
         parquet_path: str,
         max_length:   int = 100,
+        expanded_mech: bool = False,
     ):
-        self.tokenizer  = _get_tokenizer()
-        self.max_length = max_length
+        self.tokenizer     = _get_tokenizer()
+        self.max_length    = max_length
+        self.expanded_mech = expanded_mech   # [V6] 3 → 6 mechanistic channels
 
         print(f"Loading FireProtDB data from {Path(parquet_path).name} …")
         df = pd.read_parquet(parquet_path)
@@ -534,8 +572,8 @@ class FireProtDataset(Dataset):
 
         tok_wt   = _tokenize(self.tokenizer, seq_wt, self.max_length)
         tok_mt   = _tokenize(self.tokenizer, seq_mt, self.max_length)
-        mech_wt  = _protein_only_mech(seq_wt, self.max_length)
-        mech_mt  = _protein_only_mech(seq_mt, self.max_length)
+        mech_wt  = mechanistic_features_for_protein(seq_wt, self.max_length, self.expanded_mech)
+        mech_mt  = mechanistic_features_for_protein(seq_mt, self.max_length, self.expanded_mech)
 
         return {
             # Wild-type

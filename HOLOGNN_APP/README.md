@@ -21,7 +21,8 @@ interactive UI.
 | **Stability Landscape** | Interactive **heatmap** of every substitution × position; colour = predicted thermodynamic effect | "visualise predicted stability landscapes as interactive heatmaps" |
 | **IDR Ensemble** | Radius-of-gyration distribution (μ/σ) + per-residue compaction/expansion profile | "explore IDR ensemble distributions … compaction/expansion annotations" |
 | **AlphaFold Compare** | Fetches an AlphaFold2 model by UniProt ID and shows **pLDDT-coloured 3-D structure + PAE** beside Holo-GNN's prediction | "compare Holo-GNN predictions against AlphaFold2 pLDDT and PAE side-by-side" |
-| **Export** | Download results as **CSV / JSON / PDB** (B-factor-annotated) | "export results in standardised formats" |
+| **Export** | Download results as **CSV / JSON / PDB** (B-factor-annotated); re-hydrates from history on load so results survive a page refresh | "export results in standardised formats" |
+| **History** | Browse, view, re-export, and delete every past prediction stored in the local SQLite database | persistent local run log |
 
 ---
 
@@ -57,6 +58,37 @@ Check you have these before starting:
 
 Internet is needed only for: the **AlphaFold Compare** tab (queries the EBI AlphaFold DB), and — in
 full mode — the one-time ESM-2 weights download. Everything else works offline.
+
+---
+
+## One-command launcher (recommended)
+
+From the **repository root** a single script handles everything — venv creation, dep install, frontend build, server start, and browser open:
+
+```bash
+python runapp.py
+```
+
+The app will be available at **http://127.0.0.1:8000**.
+
+What `runapp.py` does automatically:
+1. Creates `HOLOGNN_APP/backend/.venv` and installs the lightweight backend deps.
+2. Builds the frontend (`npm run build`) if `dist/` is missing — skipped gracefully if Node/npm is absent.
+3. Starts uvicorn and health-checks `/api/health`.
+4. Opens the browser.
+
+Useful flags:
+
+| Flag | Effect |
+|------|--------|
+| `--full` | Also installs the model stack (torch, transformers, etc.) for real inference |
+| `--weights PATH` | Use trained weights at PATH; sets `HOLOGNN_WEIGHTS` |
+| `--port N` | Listen on port N (default 8000) |
+| `--no-browser` | Skip the automatic browser open |
+| `--rebuild-frontend` | Force a fresh `npm run build` even if `dist/` already exists |
+| `--dev` | Run the Vite hot-reload dev server alongside the backend |
+
+Without `--full` and without weights the app starts in **demo mode** (deterministic biophysical heuristic) — no heavy dependencies required.
 
 ---
 
@@ -126,9 +158,10 @@ HOLOGNN_APP/
 │   ├── inference.py      # model wrapper + deterministic demo fallback
 │   ├── requirements.txt  # lightweight deps (fastapi, uvicorn, requests, numpy, pydantic)
 │   ├── run.sh / run.bat  # venv bootstrap + launch
+│   ├── holognn_history.db  # SQLite prediction history (created on first run, git-ignored)
 │   └── .venv/            # created on first run (git-ignored)
 └── frontend/
-    ├── src/              # React + TypeScript SPA (5 tabs)
+    ├── src/              # React + TypeScript SPA (6 tabs, including History)
     ├── package.json
     ├── vite.config.ts
     └── dist/             # built static site (created by `npm run build`)
@@ -151,6 +184,37 @@ All endpoints are under `/api`. Sign convention: **ΔΔG > 0 = stabilizing, ΔΔ
 
 ---
 
+## Prediction history (SQLite)
+
+Every prediction — ΔΔG, stability scan, IDR ensemble, and AlphaFold compare — is automatically persisted to a local **SQLite** database at:
+
+```
+HOLOGNN_APP/backend/holognn_history.db
+```
+
+The file is created on first run and is gitignored. It uses the Python standard-library `sqlite3` module with zero external dependencies — the right fit for a single-user local app.
+
+### History tab (6th tab)
+
+The **History** tab lets you:
+- Browse all past predictions, filterable by kind (ddg / scan / idr / compare).
+- View the full saved result for any past run.
+- Re-export any past result as CSV / JSON / PDB.
+- Delete individual records or clear the entire history.
+
+The **Export** tab also re-hydrates from history on load, so results are available even after a page refresh or backend restart.
+
+### History API endpoints
+
+| Method & path | Description |
+|---------------|-------------|
+| `GET  /api/history?kind=&limit=` | List past predictions (optional filter by kind, default limit 100) |
+| `GET  /api/history/{id}` | Fetch full saved result for a single record |
+| `DELETE /api/history/{id}` | Delete a single record |
+| `DELETE /api/history` | Clear all history |
+
+---
+
 ## Troubleshooting
 
 - **"Frontend not built yet" JSON at `/`** — run `npm run build` in `frontend/`, then restart the backend.
@@ -161,4 +225,4 @@ All endpoints are under `/api`. Sign convention: **ΔΔG > 0 = stabilizing, ΔΔ
 
 ---
 
-See the model documentation and citation in [`../HoloGNN/README.md`](../HoloGNN/README.md).
+See the model documentation and citation in [`../README.md`](../README.md).

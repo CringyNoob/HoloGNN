@@ -10,6 +10,8 @@ import type {
   CompareRequest,
   CompareResponse,
   ExportRequest,
+  HistoryItem,
+  HistoryRecord,
 } from './types'
 
 const client = axios.create({
@@ -84,4 +86,22 @@ export async function downloadExport(
   a.click()
   document.body.removeChild(a)
   URL.revokeObjectURL(url)
+}
+
+export async function getHistory(kind?: string, limit = 50): Promise<HistoryItem[]> {
+  const res = await client.get<{ items: HistoryItem[] }>('/history', { params: { kind, limit } })
+  return res.data.items
+}
+
+export async function getHistoryItem(id: number): Promise<HistoryRecord> {
+  const res = await client.get<HistoryRecord>(`/history/${id}`)
+  return res.data
+}
+
+export async function deleteHistoryItem(id: number): Promise<void> {
+  await client.delete(`/history/${id}`)
+}
+
+export async function clearHistory(kind?: string): Promise<void> {
+  await client.delete('/history', { params: { kind } })
 }

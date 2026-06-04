@@ -56,19 +56,62 @@ class ProteomicsHead(nn.Module):
 
 # ---------------------------------------------------------------------------
 # 2. Siamese Stability Head (FireProtDB / MegaScale) — ΔΔG via antisymmetry
+#    [V6] Optional heteroscedastic output (μ, log σ²) for calibrated uncertainty.
 # ---------------------------------------------------------------------------
 class SiameseStabilityHead(nn.Module):
-    def __init__(self, input_dim: int = 512):
+    def __init__(self, input_dim: int = 512, heteroscedastic: bool = False):
         super().__init__()
+        self.heteroscedastic = heteroscedastic
+        out_dim = 2 if heteroscedastic else 1
         self.mlp = nn.Sequential(
             nn.Linear(input_dim, 256),
             nn.ReLU(),
-            nn.Linear(256, 1),  # Output: ΔΔG
+            nn.Linear(256, out_dim),  # ΔΔG  (and log σ² when heteroscedastic)
         )
 
     def forward(self, embedding_wildtype, embedding_mutant):
         diff = embedding_mutant - embedding_wildtype   # difference vector
-        return self.mlp(diff)
+        out = self.mlp(diff)
+        if self.heteroscedastic:
+            return out[..., :1], out[..., 1:2]         # (μ, log σ²)
+        return out                                     # (B, 1)
+
+
+# ---------------------------------------------------------------------------
+# 2b. [V6] Antisymmetric-by-construction stability head
+#     Each embedding is mapped to a scalar stability score s(z); the prediction
+#     ΔΔG(wt→mt) = s(z_mt) − s(z_wt) is then EXACTLY antisymmetric by design —
+#     ΔΔG(a→b) = −ΔΔG(b→a) holds identically, so the model cannot exhibit the
+#     destabilisation bias and the AntisymmetricLoss penalty is ~0 a priori.
+#     With heteroscedastic=True each score also carries a variance, and the
+#     variance of the difference is var(s_wt) + var(s_mt).
+# ---------------------------------------------------------------------------
+class StabilityScoreHead(nn.Module):
+    def __init__(self, input_dim: int = 512, heteroscedastic: bool = False):
+        super().__init__()
+        self.heteroscedastic = heteroscedastic
+        out_dim = 2 if heteroscedastic else 1
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, 256),
+            nn.ReLU(),
+            nn.Linear(256, out_dim),  # scalar stability score (+ log var)
+        )
+
+    def score(self, z):
+        o = self.net(z)
+        if self.heteroscedastic:
+            return o[..., :1], o[..., 1:2]
+        return o, None
+
+    def forward(self, embedding_wildtype, embedding_mutant):
+        mu_wt, lv_wt = self.score(embedding_wildtype)
+        mu_mt, lv_mt = self.score(embedding_mutant)
+        ddg = mu_mt - mu_wt                            # antisymmetric by construction
+        if self.heteroscedastic:
+            var    = torch.exp(lv_wt) + torch.exp(lv_mt)
+            logvar = torch.log(var + 1e-8)
+            return ddg, logvar
+        return ddg, None
 
 
 # ---------------------------------------------------------------------------

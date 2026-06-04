@@ -30,6 +30,8 @@ from tqdm import tqdm
 from src.dataset import FireProtDataset
 from src.full_model import HoloGNN
 from src.loss import AntisymmetricLoss
+from src.device import describe_device
+from src.metrics import regression_metrics, format_report
 
 # --- CONFIGURATION ---
 DATA_PATH     = "data/fireprotdb/fireprotdb_clean.parquet"
@@ -53,8 +55,8 @@ def _make_batch(batch, suffix, device):
 
 
 def train():
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"--- SIAMESE ΔΔG TRAINING on {device} ---")
+    print("--- SIAMESE ΔΔG TRAINING ---")
+    device = describe_device()
 
     model     = HoloGNN().to(device)
     criterion = AntisymmetricLoss(alpha=ALPHA)
@@ -88,9 +90,10 @@ def train():
             n = bar.n + 1
             bar.set_postfix({"loss": run_loss/n, "anti": run_anti/n, "fid": run_fid/n})
 
-        # --- validation ---
+        # --- validation: loss + held-out ΔΔG regression metrics ---
         model.eval()
         val_loss = 0.0
+        val_preds, val_labels = [], []
         with torch.no_grad():
             for batch in val_loader:
                 data_wt = _make_batch(batch, "wt", device)
@@ -99,7 +102,11 @@ def train():
                 dG_fwd, dG_rev = model((data_wt, data_mt), task="idr")
                 l, _ = criterion(dG_fwd, dG_rev, labels)
                 val_loss += l.item()
+                val_preds.extend(dG_fwd.squeeze(-1).detach().cpu().tolist())
+                val_labels.extend(labels.detach().cpu().tolist())
         print(f"Epoch {epoch+1}: val_loss = {val_loss/max(1,len(val_loader)):.4f}")
+        print(format_report(regression_metrics(val_labels, val_preds),
+                            f"Epoch {epoch+1} validation (ΔΔG)"))
 
         torch.save(model.state_dict(), SAVE_PATH)
         print(f"  checkpoint saved → {SAVE_PATH}")

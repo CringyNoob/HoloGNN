@@ -3,7 +3,7 @@
 **A unified, geometry-aware Graph Neural Network for protein stability, interaction, and expression prediction — from sequence alone, with no MSAs and no crystal structures.**
 
 <p align="center">
-  <img src="images/holognn_final_metrics.png" alt="Holo-GNN performance summary" width="85%">
+  <img src="HoloGNN/images/holognn_final_metrics.png" alt="Holo-GNN performance summary" width="85%">
 </p>
 
 Holo-GNN bridges the gap between 1-D protein sequences and 3-D structural biology. Instead of treating a protein as flat text, it **dynamically constructs a graph** of the molecule in real time from an ESM-2 language model's attention map — letting the network "see" 3-D geometry **without** expensive multiple-sequence alignments (MSAs) or crystal-structure (PDB) files. On top of that geometric backbone it learns **protein physics** (Gibbs free energy ΔG / ΔΔG) and transfers that knowledge to downstream tasks such as variant pathogenicity and intrinsically-disordered-region (IDR) ensembles.
@@ -48,6 +48,7 @@ The amino-acid sequence is tokenized and embedded by **ESM-2 `t6_8M`** (`faceboo
 - **Dynamic graph construction.** Edges between residues are drawn from the ESM-2 **attention map**: if residue *A* strongly attends to residue *B*, an edge is created, approximating a physical 3-D contact (`build_attention_graph`, [`src/backbone.py`](src/backbone.py)).
 - **Mechanistic feature injection.** Three biophysical channels are concatenated onto every node before message passing: **mRNA-fold proxy** (codon GC-skew × stacking energy), **Codon Adaptation Index** (CAI, *E. coli* K-12 usage), and **local charge** (Henderson–Hasselbalch at pH 7.4). See [`src/dataset.py`](src/dataset.py).
 - **GATv2 + residual.** Two **GATv2Conv** layers (Brody et al., ICLR 2022 — strictly more expressive *dynamic* attention than GATv1) refine the graph, with a **residual skip connection** from the raw ESM-2 embeddings plus LayerNorm to prevent over-smoothing.
+- **V6 backbone (default).** Each protein gets its **own** attention graph (not one shared per batch), with the attention weight kept as a **GATv2 edge feature**, top-k neighbours, and guaranteed backbone `(i,i+1)` edges; the graph embedding uses **mask-aware attention pooling** (padding never contributes). Revert with `pool="mean"`, `graph_mode="shared"`. See [`changelog.md`](changelog.md) for the full list of V6 improvements and opt-in flags (antisymmetric-by-construction ΔΔG head, calibrated `μ/σ` uncertainty, expanded mechanistic features, ESM freezing).
 
 ### 3. Task heads ([`src/heads.py`](src/heads.py))
 | Head | `task=` | Output |
@@ -78,8 +79,8 @@ Evaluated on the **Tsuboyama et al. mega-scale** dataset (1,841,285 independent 
 | Mean antisymmetry violation | **0.7408 kcal/mol** |
 
 <p align="center">
-  <img src="images/Figure_1_Correlation.png" alt="Predicted vs. experimental ΔΔG" width="48%">
-  <img src="images/training_loss_curve.png" alt="Training loss curve" width="48%">
+  <img src="HoloGNN/images/Figure_1_Correlation.png" alt="Predicted vs. experimental ΔΔG" width="48%">
+  <img src="HoloGNN/images/training_loss_curve.png" alt="Training loss curve" width="48%">
 </p>
 
 ### Phase 2 — Pathogenicity (helix-breaker transfer experiment)
@@ -94,8 +95,8 @@ Backbone frozen; only the classification head trained, then validated on 500 syn
 The model is deliberately **risk-averse** — it almost never flags a benign variant (high specificity), at the cost of sensitivity. Confusion matrix and ROC below:
 
 <p align="center">
-  <img src="images/Figure_2_ConfusionMatrix.png" alt="Confusion matrix" width="42%">
-  <img src="images/Figure_3_ROC.png" alt="ROC curve" width="42%">
+  <img src="HoloGNN/images/Figure_2_ConfusionMatrix.png" alt="Confusion matrix" width="42%">
+  <img src="HoloGNN/images/Figure_3_ROC.png" alt="ROC curve" width="42%">
 </p>
 
 > All figures are reproducible with `python make_figures.py --figure all` (writes to `images/`).
@@ -141,9 +142,43 @@ Notes:
 - **`torch_geometric` is optional.** If it is missing the backbone bypasses the GATv2 layers via a fallback projection (it no longer zeroes the features) so the model still runs; install it for the full dynamic-attention path.
 - The repo ships **no trained weights** (`*.pth` is git-ignored). Without them, `predict.py` runs a deterministic biophysical heuristic ("demo mode"). Provide `holognn_stability_final.pth` (or set `HOLOGNN_WEIGHTS`) for full inference.
 
+### Hardware / GPU setup
+
+Training and inference run on **CUDA** or **CPU** — CPU works but is slow for large batches. AMD CPUs (x86_64) are fully supported; only the NVIDIA GPU + CUDA path requires special attention.
+
+**RTX 50-series (Blackwell, sm_120 — e.g. RTX 5070 Ti):** a plain `pip install torch` may install a wheel that does not include sm_120 kernels, causing a "no kernel image is available for the device" error or a silent fall-back to CPU. Install the **CUDA 12.8 (cu128) wheel first**, then the rest of the requirements:
+
+```bash
+pip install torch --index-url https://download.pytorch.org/whl/cu128
+pip install -r HoloGNN/requirements.txt
+```
+
+Every training, evaluation, and inference script prints the detected device on launch (e.g. `[device] CUDA: NVIDIA RTX 5070 Ti (sm_120, …)`) and emits a clear warning with the cu128 fix command if the installed PyTorch cannot target the detected card. Device detection is implemented in [`HoloGNN/src/device.py`](HoloGNN/src/device.py).
+
 ---
 
 ## Quick start
+
+### One-command launcher (web app)
+
+From the **repository root**, a single command starts the full web app (FastAPI backend + built React frontend) and opens the browser automatically:
+
+```bash
+python runapp.py
+```
+
+`runapp.py` auto-creates `HOLOGNN_APP/backend/.venv`, installs the lightweight backend deps, builds the frontend if `dist/` is missing (needs Node/npm — skipped gracefully when absent), starts uvicorn, health-checks `/api/health`, and opens http://127.0.0.1:8000.
+
+| Flag | Effect |
+|------|--------|
+| `--full` | Also installs the model stack (torch, transformers, etc.) for real inference |
+| `--weights PATH` | Use trained weights at PATH; sets `HOLOGNN_WEIGHTS` |
+| `--port N` | Listen on port N (default 8000) |
+| `--no-browser` | Skip the automatic browser open |
+| `--rebuild-frontend` | Force a fresh `npm run build` even if `dist/` already exists |
+| `--dev` | Run the Vite hot-reload dev server alongside the backend |
+
+Without `--full` and without weights the app starts in **demo mode** (deterministic biophysical heuristic) — no heavy dependencies required.
 
 ### Predict a stability change (ΔΔG)
 ```bash
@@ -173,6 +208,24 @@ python pretrain_uniref.py    # optional masked-LM pre-training on UniRef50 shard
 
 The model exposes tasks via `model(data, task=...)`: `idr` (paired ΔΔG), `stability`, `proteomics`, `three_state`, `mfi`. See `forward()` in [`src/full_model.py`](src/full_model.py).
 
+### Evaluate a checkpoint
+
+`HoloGNN/evaluate.py` loads a saved checkpoint and scores it on a dataset, writing a `metrics_<task>.json` summary file:
+
+```bash
+python evaluate.py --task stability     --weights holognn_stability_final.pth --data <megascale.parquet|csv>
+python evaluate.py --task ddg           --weights holognn_stability_final.pth --data <fireprotdb_clean.parquet>
+python evaluate.py --task pathogenicity --weights holognn_stability_final.pth --data <clinvar_clean.parquet>
+```
+
+Supported tasks: `stability`, `ddg`, `pathogenicity`, `proteomics`. For the `pathogenicity` task (ClinVar benign/pathogenic) the model's ΔΔG destabilisation score is used as the pathogenicity signal (`sigmoid(-ΔΔG)`) and reported with AUROC/AUPRC/F1.
+
+Shared metrics live in [`HoloGNN/src/metrics.py`](HoloGNN/src/metrics.py):
+- **Regression:** Pearson r, Spearman ρ, RMSE, MAE, R²
+- **Binary classification:** AUROC, AUPRC, F1, precision, recall, accuracy, MCC
+
+The training scripts also print held-out **validation metrics each epoch**: regression metrics for `train.py`, `train_final.py`, and `train_siamese.py`; AUROC / AUPRC / F1 for `train_proteomics.py`.
+
 ### Regenerate all paper figures
 ```bash
 python make_figures.py --figure all          # → images/
@@ -192,6 +245,8 @@ A browser-based dashboard (paper §8.1) lets non-computational researchers use H
 - **CSV / JSON / PDB-annotation** export.
 
 It works against the same model package and falls back to demo mode when no weights are present. See `../HOLOGNN_APP/README.md` for setup.
+
+Every prediction (ΔΔG / scan / IDR / AlphaFold compare) is now persisted to a local **SQLite** database at `HOLOGNN_APP/backend/holognn_history.db` (gitignored, created automatically). A **History** tab (6th tab) lets you browse, re-export, and delete past runs; the Export tab re-hydrates from history on load so results survive a page refresh.
 
 ---
 
@@ -214,15 +269,19 @@ Typical workflow: `gsutil -m rsync` the dataset bucket → extract to `data/mega
 ```
 HoloGNN/
 ├── src/
-│   ├── full_model.py        # HoloGNN multi-task model (all tasks + §8.2 flags)
-│   ├── backbone.py          # ESM-2 → (opt. SSM) → (opt. cross-attn) fusion → GATv2 + residual
-│   ├── heads.py             # Siamese/Stability/Proteomics/IDR + ThreeState/MFI heads
+│   ├── full_model.py        # HoloGNN multi-task model (all tasks + §8.2/V6 flags)
+│   ├── backbone.py          # ESM-2 → (opt. SSM) → fusion → per-sample GATv2 → masked pool
+│   ├── heads.py             # Siamese/Stability/Score/Proteomics/IDR + ThreeState/MFI heads
+│   ├── pooling.py           # [V6] mask-aware attention pooling
 │   ├── sequence_mixers.py   # §8.2 CrossAttentionFusion + Mamba/SelectiveSSM
-│   ├── dataset.py           # mechanistic features + dataset loaders
+│   ├── dataset.py           # mechanistic features (3 or 6 ch) + dataset loaders
 │   ├── heuristics.py        # deterministic biophysical demo fallback
-│   ├── loss.py              # antisymmetric loss
-│   └── utils/graph_builder.py
+│   ├── loss.py              # antisymmetric + heteroscedastic (Gaussian-NLL) losses
+│   ├── device.py            # device detection + RTX 50-series / sm_120 cu128 warning
+│   ├── metrics.py           # shared regression + classification metrics
+│   └── utils/graph_builder.py  # [V6] per-sample attention graphs + edge weights
 ├── predict.py               # CLI ΔΔG predictor (full + demo modes)
+├── evaluate.py              # checkpoint evaluation → metrics_<task>.json
 ├── make_figures.py          # single "image maker" — regenerates every figure
 ├── train_siamese.py         # Siamese ΔΔG + AntisymmetricLoss (flagship)
 ├── train_final.py / train.py / train_proteomics.py / pretrain_uniref.py
@@ -236,13 +295,14 @@ HoloGNN/
 
 ## What changed over time
 
-Holo-GNN evolved through five architectures. Each step targeted a specific failure mode:
+Holo-GNN evolved through six architectures. Each step targeted a specific failure mode:
 
 - **V1 — Linear-graph MVP.** Residues connected only to neighbours (i → i+1); ESM-2 swapped in for MSAs. Proved the concept but scaled poorly (*r* ≈ 0.42 on orphan targets).
 - **V2 — Attention graph.** Edges built from the ESM-2 attention map instead of a fixed chain, giving the model real long-range "contacts." Solved the orphan-protein bottleneck.
 - **V3 — Mechanistic injection + GAT.** Added the three biophysical channels (CAI, charge, mRNA-fold) and Graph Attention layers; MAE dropped to **2.30 kcal/mol**.
 - **V4 — Siamese + antisymmetric loss.** Wild-type and mutant scored in tandem with an antisymmetry constraint, **eliminating destabilization bias** and breaking *r* > 0.70 for the first time.
-- **V5 — Production (current).** GATv1 → **GATv2** dynamic attention, residual skip connections, *true* mechanistic features, and full cloud scaling (batch 64) on **1.84 M** MegaScale mutations → **r = 0.7644, MAE = 1.65, RMSE = 2.02 kcal/mol**.
+- **V5 — Production.** GATv1 → **GATv2** dynamic attention, residual skip connections, *true* mechanistic features, and full cloud scaling (batch 64) on **1.84 M** MegaScale mutations → **r = 0.7644, MAE = 1.65, RMSE = 2.02 kcal/mol**.
+- **V6 — Representation fixes (current).** Per-sample attention graphs with edge weights/top-k/backbone edges + mask-aware attention pooling (new defaults), plus opt-in antisymmetric-by-construction ΔΔG (exact reversibility), calibrated `μ/σ` uncertainty, expanded protein-only mechanistic features, and ESM freezing. Full details in [`changelog.md`](changelog.md).
 
 ---
 

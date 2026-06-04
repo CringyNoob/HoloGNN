@@ -21,6 +21,14 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from inference import get_engine
+from db import (
+    init_db,
+    insert_prediction,
+    list_predictions,
+    get_prediction,
+    delete_prediction,
+    clear_history,
+)
 
 # ---------------------------------------------------------------------------
 # Application setup
@@ -34,6 +42,10 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Prediction history is persisted in a local SQLite file (see db.py) so results
+# survive page refreshes and server restarts.
+init_db()
 
 # ---------------------------------------------------------------------------
 # Pydantic request models
@@ -85,6 +97,11 @@ def _error(status: int, detail: str) -> Response:
     )
 
 
+def _as_dict(model: BaseModel) -> Dict[str, Any]:
+    """Pydantic v1/v2-safe dict() for persisting the request payload."""
+    return model.model_dump() if hasattr(model, "model_dump") else model.dict()
+
+
 # ---------------------------------------------------------------------------
 # API endpoints
 # ---------------------------------------------------------------------------
@@ -99,27 +116,40 @@ def health() -> Dict:
 def ddg(req: DdgRequest):
     eng = get_engine()
     try:
-        return eng.predict_ddg(req.wt_sequence, req.mutation)
+        result = eng.predict_ddg(req.wt_sequence, req.mutation)
     except ValueError as exc:
         return _error(400, str(exc))
+    summary = (f"ΔΔG {result['mutation']} = {result['ddg']:+.2f} kcal/mol "
+               f"({result['verdict']})")
+    insert_prediction("ddg", summary, _as_dict(req), result)
+    return result
 
 
 @app.post("/api/scan")
 def scan(req: ScanRequest):
     eng = get_engine()
     try:
-        return eng.mutation_scan(req.sequence, req.start, req.end)
+        result = eng.mutation_scan(req.sequence, req.start, req.end)
     except ValueError as exc:
         return _error(400, str(exc))
+    pos = result["positions"]
+    summary = (f"Scan {len(pos)} positions (residues {pos[0]}–{pos[-1]})"
+               if pos else "Scan (empty window)")
+    insert_prediction("scan", summary, _as_dict(req), result)
+    return result
 
 
 @app.post("/api/idr")
 def idr(req: IdrRequest):
     eng = get_engine()
     try:
-        return eng.idr_ensemble(req.sequence)
+        result = eng.idr_ensemble(req.sequence)
     except ValueError as exc:
         return _error(400, str(exc))
+    summary = (f"IDR ensemble · L={result['length']} · "
+               f"Rg μ={result['mu']:.1f} σ={result['sigma']:.2f}")
+    insert_prediction("idr", summary, _as_dict(req), result)
+    return result
 
 
 @app.post("/api/compare")
@@ -140,6 +170,9 @@ def compare(req: CompareRequest):
         pdb_url = meta.get("pdbUrl", "")
         pae_doc_url = meta.get("paeDocUrl", meta.get("paeImageUrl", ""))
         sequence = meta.get("uniprotSequence", "")
+
+        if not pdb_url:
+            return _error(502, f"AlphaFold entry for {uid} has no downloadable PDB URL.")
 
         # 2. Fetch PDB structure text
         pdb_resp = _requests.get(pdb_url, timeout=20)
@@ -190,7 +223,7 @@ def compare(req: CompareRequest):
             except ValueError:
                 holognn_min_ddg = []
 
-        return {
+        result = {
             "uniprot_id": uid,
             "sequence": sequence,
             "structure_pdb": structure_pdb,
@@ -200,6 +233,9 @@ def compare(req: CompareRequest):
             "holognn_min_ddg": holognn_min_ddg,
             "demo_mode": eng.demo_mode,
         }
+        summary = f"AlphaFold compare · {uid} · {len(sequence)} residues"
+        insert_prediction("compare", summary, _as_dict(req), result)
+        return result
 
     except _requests.exceptions.Timeout:
         return _error(502, f"Request to AlphaFold timed out for {uid}")
@@ -321,6 +357,39 @@ def export(req: ExportRequest):
 
     else:
         return _error(400, f"Unknown export format '{req.format}'. Use csv, json, or pdb.")
+
+
+# ---------------------------------------------------------------------------
+# Prediction history (SQLite-backed)
+# ---------------------------------------------------------------------------
+
+@app.get("/api/history")
+def history(kind: Optional[str] = None, limit: int = 50):
+    """Most-recent-first prediction history (metadata only). Optional ?kind=."""
+    return {"items": list_predictions(kind, limit)}
+
+
+@app.get("/api/history/{pred_id}")
+def history_item(pred_id: int):
+    """Full record (request + response payload) for one prediction."""
+    item = get_prediction(pred_id)
+    if item is None:
+        return _error(404, f"No prediction with id {pred_id}.")
+    return item
+
+
+@app.delete("/api/history/{pred_id}")
+def history_delete(pred_id: int):
+    """Delete a single history entry."""
+    if not delete_prediction(pred_id):
+        return _error(404, f"No prediction with id {pred_id}.")
+    return {"deleted": pred_id}
+
+
+@app.delete("/api/history")
+def history_clear(kind: Optional[str] = None):
+    """Clear all history (or just one ?kind=)."""
+    return {"cleared": clear_history(kind)}
 
 
 # ---------------------------------------------------------------------------

@@ -136,8 +136,9 @@ def _try_full_mode():
     from src.full_model import HoloGNN        # noqa: F401
     from src.dataset    import MegaScaleDataset
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"[full] Loading model from {MODEL_PATH} on {device} ...")
+    from src.device import describe_device
+    device = describe_device()
+    print(f"[full] Loading model from {MODEL_PATH} ...")
     model = HoloGNN().to(device)
     model.load_state_dict(torch.load(MODEL_PATH, map_location=device))
     model.eval()

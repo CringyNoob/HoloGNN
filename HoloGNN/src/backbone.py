@@ -25,6 +25,9 @@ from transformers import EsmModel
 
 # Future-work modules (§8.2) — optional, off by default.
 from src.sequence_mixers import CrossAttentionFusion, SelectiveSSM
+# V6 modules.
+from src.pooling import AttentionPooling, masked_mean
+from src.utils.graph_builder import build_batched_attention_graph
 
 # ---------------------------------------------------------------------------
 # Optional PyG import — tries GATv2Conv first (V5.0), falls back gracefully
@@ -101,70 +104,106 @@ class HoloGNNBackbone(nn.Module):
 
     def __init__(self, output_dim: int = 320,
                  fusion_mode: str = "concat",
-                 use_ssm: bool = False):
+                 use_ssm: bool = False,
+                 pool: str = "attention",
+                 graph_mode: str = "per_sample",
+                 mech_feature_dim: int = MECH_FEATURE_DIM,
+                 top_k: int = 8,
+                 freeze_esm: bool = False,
+                 freeze_esm_layers: int = 0):
         """
         Args:
-            output_dim  : final embedding size (default 320).
-            fusion_mode : "concat" (default, original V5 behaviour) or
-                          "cross_attention" (§8.2-i — cross-modal attention
-                          between the ESM and mechanistic tracks).
-            use_ssm     : insert a linear-time Selective-SSM / Mamba mixer
-                          (§8.2-ii) over residues before fusion (default False).
-        Both future-work options default to OFF so existing behaviour and any
-        existing checkpoints are unchanged.
+            output_dim        : final embedding size (default 320).
+            fusion_mode       : "concat" (V5) or "cross_attention" (§8.2-i).
+            use_ssm           : insert a Selective-SSM / Mamba mixer (§8.2-ii).
+            pool              : [V6] "attention" (mask-aware learned pooling,
+                                default) or "mean" (padding-aware mean; "mean"
+                                also reproduces V5 when no padding is present).
+            graph_mode        : [V6] "per_sample" (each protein its own graph
+                                with attention-weighted edges + backbone edges,
+                                default) or "shared" (V5 batch-mean topology).
+            mech_feature_dim  : number of mechanistic channels (3 = V5 default;
+                                6 enables the expanded protein-only descriptors).
+            top_k             : [V6] neighbours per node in per-sample graphs.
+            freeze_esm        : freeze the entire ESM-2 encoder.
+            freeze_esm_layers : freeze ESM-2 embeddings + the first N encoder
+                                layers (ignored if freeze_esm is True).
         """
         super().__init__()
 
         if fusion_mode not in ("concat", "cross_attention"):
             raise ValueError(f"fusion_mode must be 'concat' or 'cross_attention', got {fusion_mode!r}")
-        self.fusion_mode = fusion_mode
-        self.use_ssm     = use_ssm
+        if pool not in ("attention", "mean"):
+            raise ValueError(f"pool must be 'attention' or 'mean', got {pool!r}")
+        if graph_mode not in ("per_sample", "shared"):
+            raise ValueError(f"graph_mode must be 'per_sample' or 'shared', got {graph_mode!r}")
+
+        self.fusion_mode      = fusion_mode
+        self.use_ssm          = use_ssm
+        self.pool             = pool
+        self.graph_mode       = graph_mode
+        self.mech_feature_dim = mech_feature_dim
+        self.top_k            = top_k
+        gat_in                = ESM2_HIDDEN_DIM + mech_feature_dim   # 323 (V5) or 326
 
         # ------------------------------------------------------------------
         # 1. ESM-2 Sequence Encoder
-        #    output_attentions=True exposes attention weights for graph building.
         # ------------------------------------------------------------------
         self.esm_model = EsmModel.from_pretrained(
             "facebook/esm2_t6_8M_UR50D",
             output_attentions=True,
         )
+        self._apply_esm_freezing(freeze_esm, freeze_esm_layers)
 
         # ------------------------------------------------------------------
         # 1b. [§8.2] Optional future-work mixers (OFF by default)
         # ------------------------------------------------------------------
         self.ssm = SelectiveSSM(dim=ESM2_HIDDEN_DIM) if use_ssm else None
         self.fusion = (CrossAttentionFusion(esm_dim=ESM2_HIDDEN_DIM,
-                                            mech_dim=MECH_FEATURE_DIM)
+                                            mech_dim=mech_feature_dim)
                        if fusion_mode == "cross_attention" else None)
 
         # ------------------------------------------------------------------
-        # 2. [V5.0] GATv2Conv layers  (dynamic attention)
-        #    GATv2 is strictly more expressive than GATv1 for identical parameter
-        #    budgets, as it applies the shared weight matrix to the concatenated
-        #    pair [h_i || h_j] then applies LeakyReLU before the attention dot.
+        # 2. GATv2Conv layers (edge_dim=1 → attention weight as an edge feature;
+        #    self-loops are supplied by the graph builders, so add_self_loops=False).
         # ------------------------------------------------------------------
         if _PYGEO_AVAILABLE:
-            self.gat1 = _GAT_CLS(GAT_IN_CHANNELS, GAT_IN_CHANNELS, heads=4, concat=False)
-            self.gat2 = _GAT_CLS(GAT_IN_CHANNELS, output_dim,      heads=4, concat=False)
+            self.gat1 = _GAT_CLS(gat_in, gat_in,     heads=4, concat=False,
+                                 edge_dim=1, add_self_loops=False)
+            self.gat2 = _GAT_CLS(gat_in, output_dim, heads=4, concat=False,
+                                 edge_dim=1, add_self_loops=False)
 
         # ------------------------------------------------------------------
-        # 3. [V5.0] Residual projection
-        #    Projects raw ESM-2 embeddings (ESM2_HIDDEN_DIM = 320) to output_dim
-        #    so they can be added directly to the GATv2 output.
-        #    If ESM2_HIDDEN_DIM == output_dim this is an identity.
+        # 3. Residual projection (raw ESM-2 → output_dim)
         # ------------------------------------------------------------------
         if ESM2_HIDDEN_DIM != output_dim:
             self.residual_proj = nn.Linear(ESM2_HIDDEN_DIM, output_dim, bias=False)
         else:
             self.residual_proj = nn.Identity()
 
-        # Projection used only when torch_geometric is unavailable, so the
-        # GAT-bypass path still maps GAT_IN_CHANNELS (323) → output_dim instead
-        # of silently zeroing the features.
-        self.fallback_proj = nn.Linear(GAT_IN_CHANNELS, output_dim)
+        # Used only when torch_geometric is unavailable (GAT bypass).
+        self.fallback_proj = nn.Linear(gat_in, output_dim)
+
+        # [V6] Mask-aware pooling head.
+        self.pool_layer = AttentionPooling(output_dim) if pool == "attention" else None
 
         self.layer_norm = nn.LayerNorm(output_dim)
         self.relu       = nn.ReLU()
+
+    # -----------------------------------------------------------------------
+    def _apply_esm_freezing(self, freeze_esm: bool, freeze_esm_layers: int) -> None:
+        """Freeze the whole ESM-2 encoder, or its embeddings + first N layers."""
+        if freeze_esm:
+            for p in self.esm_model.parameters():
+                p.requires_grad = False
+            return
+        if freeze_esm_layers and freeze_esm_layers > 0:
+            for p in self.esm_model.embeddings.parameters():
+                p.requires_grad = False
+            layers = self.esm_model.encoder.layer
+            for layer in layers[:min(freeze_esm_layers, len(layers))]:
+                for p in layer.parameters():
+                    p.requires_grad = False
 
     # -----------------------------------------------------------------------
     def forward(
@@ -216,27 +255,53 @@ class HoloGNNBackbone(nn.Module):
         # node_embeddings is now (B, L, 323)
 
         # ------------------------------------------------------------------
-        # Step 3  [V2.0]: Dynamic graph construction from ESM-2 attention map
+        # Step 3  [V6]: Dynamic graph construction from the ESM-2 attention map.
+        #   "per_sample" → each protein gets its own attention-weighted graph
+        #                  (top-k + backbone edges); the weights become edge_attr.
+        #   "shared"     → V5 batch-mean topology, replicated per sample with
+        #                  unit edge weights (kept for backward comparison).
         # ------------------------------------------------------------------
+        device   = input_ids.device
+        edge_attr = None
         if edge_index is None and _PYGEO_AVAILABLE:
             last_attn_layer = esm_out.attentions[-1]                # (B, heads, L, L)
             avg_attention   = torch.mean(last_attn_layer, dim=1)   # (B, L, L)
-            batch_avg_attn  = torch.mean(avg_attention,  dim=0)    # (L, L) shared topology
-            edge_index      = build_attention_graph(batch_avg_attn, threshold=attention_threshold)
-            edge_index      = edge_index.to(input_ids.device)
+
+            if self.graph_mode == "per_sample":
+                edge_index, edge_attr = build_batched_attention_graph(
+                    avg_attention, attention_mask, k=self.top_k, add_backbone=True
+                )
+            else:  # "shared" (V5)
+                shared     = torch.mean(avg_attention, dim=0)      # (L, L)
+                base_ei    = build_attention_graph(shared, threshold=attention_threshold)
+                diag       = torch.arange(L, device=device)        # self-loops
+                base_src   = torch.cat([base_ei[0], diag])
+                base_dst   = torch.cat([base_ei[1], diag])
+                srcs, dsts = [], []
+                for b in range(B):
+                    srcs.append(base_src + b * L)
+                    dsts.append(base_dst + b * L)
+                edge_index = torch.stack([torch.cat(srcs), torch.cat(dsts)], dim=0).long()
+                edge_attr  = torch.ones(edge_index.size(1), 1, device=device)
+            edge_index = edge_index.to(device)
+            edge_attr  = edge_attr.to(device)
+
+        # A caller-supplied edge_index arrives without weights → use unit weights.
+        if edge_index is not None and edge_attr is None and _PYGEO_AVAILABLE:
+            edge_attr = torch.ones(edge_index.size(1), 1, device=device)
 
         # ------------------------------------------------------------------
-        # Step 4  [V5.0]: GATv2Conv message passing (dynamic attention)
+        # Step 4: GATv2Conv message passing (attention weights as edge features)
         # ------------------------------------------------------------------
-        x_flat = node_embeddings.view(-1, node_embeddings.size(-1))  # (B*L, 323)
+        x_flat = node_embeddings.view(-1, node_embeddings.size(-1))  # (B*L, gat_in)
 
-        if edge_index is not None and _PYGEO_AVAILABLE:
-            x = self.relu(self.gat1(x_flat, edge_index))  # (B*L, 323)
-            x = self.gat2(x, edge_index)                  # (B*L, output_dim)
+        if edge_index is not None and edge_index.numel() > 0 and _PYGEO_AVAILABLE:
+            x = self.relu(self.gat1(x_flat, edge_index, edge_attr))  # (B*L, gat_in)
+            x = self.gat2(x, edge_index, edge_attr)                  # (B*L, output_dim)
         else:
-            # PyG unavailable — bypass GATv2 and project 323 → output_dim so the
+            # PyG unavailable (or empty graph) — bypass GATv2 and project so the
             # node features are preserved (not zeroed) before the residual add.
-            x = self.fallback_proj(x_flat)                # (B*L, output_dim)
+            x = self.fallback_proj(x_flat)                           # (B*L, output_dim)
 
         # ------------------------------------------------------------------
         # Step 5  [V5.0]: Residual skip connection
@@ -258,9 +323,13 @@ class HoloGNNBackbone(nn.Module):
         x = self.layer_norm(x + residual)                           # (B*L, output_dim)
 
         # ------------------------------------------------------------------
-        # Step 6: Mean pooling → graph-level embedding
+        # Step 6  [V6]: Mask-aware pooling → graph-level embedding.
+        #   Padding tokens never contribute (attention pool or padding-aware mean).
         # ------------------------------------------------------------------
-        x_reshaped      = x.view(B, L, -1)                          # (B, L, output_dim)
-        graph_embedding = torch.mean(x_reshaped, dim=1)             # (B, output_dim)
+        x_reshaped = x.view(B, L, -1)                               # (B, L, output_dim)
+        if self.pool_layer is not None:
+            graph_embedding = self.pool_layer(x_reshaped, attention_mask)
+        else:
+            graph_embedding = masked_mean(x_reshaped, attention_mask)
 
         return x_reshaped, graph_embedding

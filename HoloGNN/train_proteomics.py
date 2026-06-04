@@ -12,6 +12,8 @@ import random
 from src.full_model import HoloGNN
 from src.heads import ProteomicsHead
 from src.dataset import mechanistic_features_for_protein
+from src.device import describe_device
+from src.metrics import classification_metrics, format_report
 from transformers import EsmTokenizer
 
 MAX_LENGTH = 100
@@ -64,8 +66,8 @@ class StructuralDiseaseDataset(Dataset):
         }
 
 def train_proteomics():
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"--- TRANSFER LEARNING ON {device} ---")
+    print("--- TRANSFER LEARNING ---")
+    device = describe_device()
 
     # 1. Load Pre-Trained Model
     print("Loading Pre-trained Physics Brain...")
@@ -103,6 +105,7 @@ def train_proteomics():
         correct = 0
         total = 0
         n_batches = 0
+        epoch_probs, epoch_labels = [], []
 
         progress = tqdm(loader, desc=f"Epoch {epoch+1}/{EPOCHS}")
 
@@ -135,10 +138,14 @@ def train_proteomics():
             preds = (probs > 0.5).float()
             correct += (preds == labels).sum().item()
             total += labels.size(0)
+            epoch_probs.extend(probs.detach().cpu().tolist())
+            epoch_labels.extend(labels.detach().cpu().tolist())
 
             progress.set_postfix({'acc': correct/total, 'loss': total_loss/n_batches})
 
-        print(f"Epoch {epoch+1}: Accuracy = {correct/total:.4f}")
+        # Classification metrics: AUROC / AUPRC / F1 / precision / recall / MCC.
+        print(format_report(classification_metrics(epoch_labels, epoch_probs),
+                            f"Epoch {epoch+1} (disease classification)"))
 
     print("--- SUCCESS! MODEL SAVED. ---")
     torch.save(model.state_dict(), "holognn_disease_classifier.pth")

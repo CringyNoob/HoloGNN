@@ -76,3 +76,17 @@ export interface ExportRequest {
   filename?: string
   data: unknown
 }
+
+// History
+export interface HistoryItem {
+  id: number
+  kind: 'ddg' | 'scan' | 'idr' | 'compare'
+  created_at: number
+  summary: string
+  demo_mode: boolean
+}
+
+export interface HistoryRecord extends HistoryItem {
+  request: Record<string, unknown>
+  response: Record<string, unknown>
+}

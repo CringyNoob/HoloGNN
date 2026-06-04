@@ -53,7 +53,8 @@ def _try_load_model():
         print(f"[demo] inference stack unavailable ({exc.__class__.__name__}); using heuristic.")
         return None
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    from src.device import describe_device
+    device = describe_device()
     model = HoloGNN()
     try:
         model.load_state_dict(torch.load(MODEL_PATH, map_location=device))

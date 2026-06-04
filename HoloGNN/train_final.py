@@ -11,6 +11,8 @@ import time
 # Custom Modules
 from src.dataset import MegaScaleDataset
 from src.full_model import HoloGNN
+from src.device import describe_device
+from src.metrics import regression_metrics, format_report
 
 # --- PRO SETTINGS FOR GTX 1050 Ti ---
 BATCH_SIZE = 4            # Physical limit of your GPU
@@ -24,8 +26,7 @@ MAX_SAMPLES = 100000
 
 def train():
     print("--- 1. INITIALIZING PRO TRAINING ---")
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Hardware: {torch.cuda.get_device_name(0)}")
+    device = describe_device()
     print(f"Strategy: Gradient Accumulation (Effective Batch Size = {BATCH_SIZE * ACCUMULATION_STEPS})")
     
     model = HoloGNN().to(device)
@@ -92,6 +93,23 @@ def train():
             running_loss += loss.item() * ACCUMULATION_STEPS
             progress_bar.set_postfix({'loss': running_loss / (i + 1)})
         
+        # --- Validation: held-out regression metrics ---
+        model.eval()
+        val_preds, val_labels = [], []
+        with torch.no_grad():
+            for batch in val_loader:
+                class DataBatch: pass
+                data = DataBatch()
+                data.input_ids = batch['input_ids'].to(device)
+                data.mask = batch['attention_mask'].to(device)
+                data.mechanistic_features = batch['mechanistic_features'].to(device)
+                data.edge_index = None
+                preds = model(data, task="stability").squeeze(-1)
+                val_preds.extend(preds.detach().cpu().tolist())
+                val_labels.extend(batch['label'].tolist())
+        print(format_report(regression_metrics(val_labels, val_preds),
+                            f"Epoch {epoch+1} validation (stability ΔG)"))
+
         # Save "Golden" Checkpoint (This name matches predict.py)
         torch.save(model.state_dict(), "holognn_stability_final.pth")
         print(f"Epoch {epoch+1} Saved.")

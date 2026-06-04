@@ -1,4 +1,16 @@
-torch
+# =============================================================================
+# Holo-GNN — Python dependencies
+# =============================================================================
+# GPU NOTE (NVIDIA RTX 50-series / Blackwell, e.g. RTX 5070 Ti, sm_120):
+#   A plain `pip install torch` may grab a wheel that lacks sm_120 kernels, so
+#   the GPU errors ("no kernel image is available") or silently runs on the CPU.
+#   Install the CUDA 12.8 (cu128) build FIRST, then the rest:
+#       pip install torch --index-url https://download.pytorch.org/whl/cu128
+#       pip install -r requirements.txt
+#   On launch every script prints the detected GPU + a warning if the wheel is
+#   not Blackwell-capable (see src/device.py).  CPU-only also works (slower).
+# =============================================================================
+torch>=2.7        # >=2.7 ships cu128 wheels with sm_120 (Blackwell) support
 transformers
 torch-geometric
 pandas

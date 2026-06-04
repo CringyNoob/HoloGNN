@@ -116,3 +116,57 @@ class AntisymmetricLoss(nn.Module):
         }
 
         return loss, components
+
+
+# =============================================================================
+# [V6] Calibrated-uncertainty losses
+# =============================================================================
+def gaussian_nll(mu: torch.Tensor, logvar: torch.Tensor,
+                 target: torch.Tensor) -> torch.Tensor:
+    """
+    Heteroscedastic Gaussian negative log-likelihood (mean over batch).
+
+        NLL = 0.5 * [ logσ² + (y − μ)² / σ² ]    (constant term dropped)
+
+    Training a model to minimise this yields a *calibrated* predictive variance,
+    so μ ± 1.96σ is a genuine ~95% confidence interval (rather than a heuristic
+    band). ``mu``, ``logvar`` and ``target`` are broadcast to a common shape.
+    """
+    mu      = mu.squeeze(-1)
+    logvar  = logvar.squeeze(-1)
+    target  = target.squeeze(-1) if target.dim() > 1 else target
+    inv_var = torch.exp(-logvar)
+    return torch.mean(0.5 * (logvar + inv_var * (target - mu) ** 2))
+
+
+class HeteroscedasticAntisymmetricLoss(nn.Module):
+    """
+    Antisymmetric ΔΔG loss with a calibrated (heteroscedastic) fidelity term.
+
+    Loss = alpha * (μ_fwd + μ_rev)²  +  GaussianNLL(μ_fwd, logσ², ΔΔG_exp)
+           └─── antisymmetry (≈0 with the StabilityScoreHead) ───┘
+
+    Inputs to forward():
+        dG_fwd_mu  : (B, 1) forward ΔΔG mean.
+        dG_rev_mu  : (B, 1) reverse ΔΔG mean.
+        dG_logvar  : (B, 1) predicted log-variance of the forward ΔΔG.
+        dG_exp     : (B,)   experimental ΔΔG.
+    """
+
+    def __init__(self, alpha: float = 1.0):
+        super().__init__()
+        if alpha <= 0:
+            raise ValueError(f"alpha must be positive, got {alpha}")
+        self.alpha = alpha
+
+    def forward(self, dG_fwd_mu, dG_rev_mu, dG_logvar, dG_exp):
+        mu_fwd = dG_fwd_mu.squeeze(-1)
+        mu_rev = dG_rev_mu.squeeze(-1)
+        antisymmetry = torch.mean((mu_fwd + mu_rev) ** 2)
+        nll = gaussian_nll(dG_fwd_mu, dG_logvar, dG_exp)
+        loss = self.alpha * antisymmetry + nll
+        components = {
+            "antisymmetry": antisymmetry.item(),
+            "nll":          nll.item(),
+        }
+        return loss, components
