@@ -269,11 +269,11 @@ def pretrain(
     parquet_dir:  str,
     output_path:  str,
     epochs:       int   = 3,
-    batch_size:   int   = 128,
+    batch_size:   int   = 32,
     max_length:   int   = 512,
     lr:           float = 1e-4,
     weight_decay: float = 0.01,
-    num_workers:  int   = 8,
+    num_workers:  int   = 0,
     grad_clip:    float = 1.0,
     log_interval: int   = 100,
     resume_from:  Optional[str] = None,
@@ -286,8 +286,8 @@ def pretrain(
     • Mixed precision (torch.cuda.amp):
         All forward passes run in float16 on GPU.  GradScaler handles the
         loss scaling to prevent underflow in float16 gradients.
-        This roughly halves VRAM usage vs float32, allowing batch_size=128
-        on a 24 GB L4 GPU with max_length=512.
+        Kept enabled on RTX 5070 Ti (16 GB VRAM) to exploit Tensor Cores
+        and roughly halve VRAM usage vs float32 at batch_size=32.
 
     • Gradient clipping (max_norm=1.0):
         Essential for MLM training stability — the cross-entropy loss over a
@@ -325,15 +325,18 @@ def pretrain(
         max_length    = max_length,
         shuffle_shards = True,
     )
+    # prefetch_factor MUST be None when num_workers == 0 — PyTorch raises
+    # ValueError: prefetch_factor option could only be specified in
+    # multiprocessing (num_workers > 0).
     loader = DataLoader(
         dataset,
-        batch_size       = batch_size,
-        shuffle          = True,
-        num_workers      = num_workers,
-        pin_memory       = True,
-        persistent_workers = True,
-        prefetch_factor  = 2,
-        drop_last        = True,
+        batch_size         = batch_size,
+        shuffle            = True,
+        num_workers        = num_workers,
+        pin_memory         = True,
+        persistent_workers = num_workers > 0,
+        prefetch_factor    = 2 if num_workers > 0 else None,
+        drop_last          = True,
     )
     total_steps = len(loader) * epochs
     log.info(f"  {len(dataset):,} sequences  |  {len(loader):,} steps/epoch  |"
@@ -522,13 +525,14 @@ if __name__ == "__main__":
         help="Path to save final pre-trained backbone weights.",
     )
     parser.add_argument("--epochs",      type=int,   default=3)
-    parser.add_argument("--batch_size",  type=int,   default=128,
-                        help="Sequences per batch. 128 fits 24 GB L4 at max_length=512.")
+    parser.add_argument("--batch_size",  type=int,   default=32,
+                        help="Sequences per batch. 32 fits 16 GB VRAM (RTX 5070 Ti) at max_length=512 with AMP.")
     parser.add_argument("--max_length",  type=int,   default=512,
                         help="Token sequence length. Must be ≤ 1022 (ESM-2 limit).")
     parser.add_argument("--lr",          type=float, default=1e-4)
     parser.add_argument("--weight_decay",type=float, default=0.01)
-    parser.add_argument("--num_workers", type=int,   default=8)
+    parser.add_argument("--num_workers", type=int,   default=0,
+                        help="DataLoader worker processes. 0 = main process only (safe for 16 GB RAM).")
     parser.add_argument("--grad_clip",   type=float, default=1.0)
     parser.add_argument("--log_interval",type=int,   default=100,
                         help="Print metrics every N steps.")

@@ -1,21 +1,21 @@
 """
 master_etl_pipeline.py
 ======================
-Holo-GNN V5.0 — Master ETL Pipeline
--------------------------------------
-Orchestrates parallel preprocessing of all raw biological datasets into
-optimised .parquet files for the PyTorch training loop.
+Holo-GNN V5.0 — Master ETL Pipeline (Local 16 GB Edition)
+-----------------------------------------------------------
+Sequential, single-threaded preprocessing of all raw biological datasets
+into optimised .parquet files for the PyTorch training loop.
 
-Designed for: Google Vertex AI · 16 vCPUs · 64 GB RAM
-Parallelism:  concurrent.futures.ProcessPoolExecutor (max 14 workers)
-Dataframes:   polars (lazy evaluation, arrow memory, multithreaded)
-Streaming:    manual line-by-line generators for VCF (1.7 GB) and FASTA (23 GB)
+Designed for: Local machine · 16 GB RAM · single-threaded
+Dataframes:   polars (lazy evaluation, arrow memory)
+Streaming:    BioPython SeqIO.parse for FASTA (23 GB), line-by-line for VCF
+Memory guard: 500k-sequence shard flushes + gc.collect() after every write
 
 Datasets processed
 ------------------
   1. FireProtDB CSV  → fireprotdb_clean.parquet
   2. ClinVar VCF     → clinvar_clean.parquet
-  3. UniRef50 FASTA  → uniref50_clean_part_NNN.parquet  (1M-seq chunks)
+  3. UniRef50 FASTA  → uniref50_clean_part_NNN.parquet  (500k-seq chunks)
   4. MegaScale CSVs  → mega_scale_clean.parquet
        • Tsuboyama2023_Dataset1_20230416.csv
        • Tsuboyama2023_Dataset2_Dataset3_20230416.csv
@@ -31,26 +31,25 @@ Usage
 from __future__ import annotations
 
 import argparse
+import gc
 import gzip
 import logging
 import os
 import re
 import sys
 import time
-from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 from typing import Generator
 
 import polars as pl
+from Bio import SeqIO
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CONFIGURATION
 # ─────────────────────────────────────────────────────────────────────────────
-MAX_WORKERS       = 14          # leave 2 cores for the OS
-FASTA_CHUNK_SIZE  = 1_000_000  # flush to parquet every N sequences  (RAM guard)
+FASTA_CHUNK_SIZE  = 500_000     # flush to parquet every N sequences  (16 GB RAM guard)
 ESM2_MAX_LEN      = 1022        # ESM-2 tokeniser hard limit
 AMBIGUOUS_AA      = set("XBZJOU")  # filter out sequences containing these
-POLARS_THREADS    = 8           # polars internal thread pool per worker
 
 # ─────────────────────────────────────────────────────────────────────────────
 # LOGGING — rich timestamped output, mirrors Vertex AI log format
@@ -67,10 +66,6 @@ log = logging.getLogger("holo_etl")
 # ─────────────────────────────────────────────────────────────────────────────
 # UTILITY HELPERS
 # ─────────────────────────────────────────────────────────────────────────────
-
-def _set_polars_threads(n: int = POLARS_THREADS) -> None:
-    """Cap polars internal thread pool — important inside child processes."""
-    os.environ["POLARS_MAX_THREADS"] = str(n)
 
 
 def _elapsed(t0: float) -> str:
@@ -109,7 +104,7 @@ def clean_fireprotdb(csv_path: Path, out_dir: Path) -> str:
 
     Returns a completion summary string for the orchestrator log.
     """
-    _set_polars_threads()
+
     t0   = time.time()
     name = csv_path.name
     log.info(f"[FireProtDB] START  {name}  ({_mb(csv_path):.1f} MB)")
@@ -231,7 +226,7 @@ def _stream_vcf(vcf_path: Path) -> Generator[dict, None, None]:
 
 
 def clean_clinvar_vcf(vcf_path: Path, out_dir: Path) -> str:
-    _set_polars_threads()
+
     t0   = time.time()
     log.info(f"[ClinVar]    START  {vcf_path.name}  ({_mb(vcf_path):.1f} MB)")
 
@@ -269,69 +264,36 @@ def clean_clinvar_vcf(vcf_path: Path, out_dir: Path) -> str:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 3. UniRef50 FASTA Cleaner
+# 3. UniRef50 FASTA Cleaner  (16 GB single-threaded edition)
 #    Input  : uniref50.fasta  (23 GB)
-#    Output : uniref50_clean_part_000.parquet, _001, … (1M-seq chunks)
+#    Output : uniref50_clean_part_000.parquet, _001, … (500k-seq chunks)
 #    Logic  :
-#      • Stream line by line; accumulate current sequence in a buffer.
-#      • On ">" header line: finalise previous sequence and emit if valid.
+#      • Single-threaded streaming via BioPython SeqIO.parse — reads one
+#        sequence at a time, never buffers the whole file.
 #      • Validity filters:
 #          a) len(seq) <= 1022   (ESM-2 OOM guard)
 #          b) no character in AMBIGUOUS_AA
-#      • Every FASTA_CHUNK_SIZE valid sequences → write parquet, clear buffer.
-#      • Parquet columns: seq_id (header up to first space), description, sequence.
+#      • Every 500,000 valid sequences → write parquet, clear list, gc.collect().
+#      • Parquet columns: seq_id, description, sequence, seq_len.
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _is_valid_sequence(seq: str) -> bool:
-    """Return True if the sequence passes all ESM-2 pre-filtering criteria."""
-    if len(seq) > ESM2_MAX_LEN:
-        return False
-    if any(c in AMBIGUOUS_AA for c in seq):
-        return False
-    return True
-
-
-def _stream_fasta(fasta_path: Path) -> Generator[tuple[str, str, str], None, None]:
-    """
-    Streaming FASTA parser.
-    Yields (seq_id, description, sequence) tuples.
-    Handles both plain .fasta and .fasta.gz files transparently.
-    """
-    opener = gzip.open if fasta_path.suffix == ".gz" else open
-    mode   = "rt"
-
-    seq_id      = ""
-    description = ""
-    seq_parts: list[str] = []
-
-    with opener(fasta_path, mode, encoding="utf-8", errors="replace") as fh:
-        for raw_line in fh:
-            line = raw_line.rstrip("\n\r")
-
-            if line.startswith(">"):
-                # Emit previous record (if any)
-                if seq_id:
-                    yield seq_id, description, "".join(seq_parts)
-
-                # Parse new header: ">UniRef50_XXXX some description"
-                header = line[1:].strip()
-                parts  = header.split(None, 1)
-                seq_id      = parts[0] if parts else ""
-                description = parts[1] if len(parts) > 1 else ""
-                seq_parts   = []
-            else:
-                seq_parts.append(line.strip().upper())
-
-    # Emit final record
-    if seq_id and seq_parts:
-        yield seq_id, description, "".join(seq_parts)
-
-
 def clean_uniref_fasta(fasta_path: Path, out_dir: Path) -> str:
-    _set_polars_threads()
+    """
+    Stream UniRef50 FASTA with BioPython SeqIO.parse.
+
+    Memory strategy (16 GB machine)
+    --------------------------------
+    SeqIO.parse yields one SeqRecord at a time — the 23 GB file is never
+    loaded into memory.  We accumulate valid sequences in a plain Python
+    list.  Every FASTA_CHUNK_SIZE (500 000) records the list is converted
+    to a polars DataFrame, written to a zstd-compressed parquet shard,
+    then the list is cleared and gc.collect() is called to return the
+    memory to the OS immediately.  Peak RSS stays under ~4 GB.
+    """
     t0   = time.time()
     log.info(f"[UniRef50]   START  {fasta_path.name}  ({_mb(fasta_path):.1f} MB)")
-    log.info(f"[UniRef50]   Chunk size: {FASTA_CHUNK_SIZE:,} sequences per parquet shard")
+    log.info(f"[UniRef50]   Mode: single-threaded BioPython SeqIO.parse")
+    log.info(f"[UniRef50]   Chunk size: {FASTA_CHUNK_SIZE:,} seqs per shard + gc.collect()")
 
     try:
         chunk: list[dict]  = []
@@ -340,7 +302,8 @@ def clean_uniref_fasta(fasta_path: Path, out_dir: Path) -> str:
         part_paths: list[Path] = []
 
         def _flush_chunk(chunk: list[dict], idx: int) -> Path:
-            df   = pl.DataFrame(chunk, schema={
+            """Write accumulated records to a parquet shard and free memory."""
+            df = pl.DataFrame(chunk, schema={
                 "seq_id":      pl.Utf8,
                 "description": pl.Utf8,
                 "sequence":    pl.Utf8,
@@ -348,13 +311,27 @@ def clean_uniref_fasta(fasta_path: Path, out_dir: Path) -> str:
             })
             p = out_dir / f"uniref50_clean_part_{idx:03d}.parquet"
             df.write_parquet(p, compression="zstd", statistics=True)
+            shard_mb = _mb(p)
             log.info(f"[UniRef50]   Flushed shard {idx:03d}  "
-                     f"{len(chunk):,} seqs  ({_mb(p):.1f} MB)  "
+                     f"{len(chunk):,} seqs  ({shard_mb:.1f} MB)  "
                      f"[{_elapsed(t0)}]")
+
+            # ── Explicit memory release — critical for 16 GB machines ─────
+            del df
+            chunk.clear()
+            gc.collect()
+            log.info(f"[UniRef50]   gc.collect() complete — memory released")
             return p
 
-        for seq_id, desc, seq in _stream_fasta(fasta_path):
+        # ── BioPython streaming parser ─────────────────────────────────────
+        # SeqIO.parse returns a generator; only one SeqRecord lives in memory
+        # at a time.  This is the correct approach for a 23 GB file on a
+        # 16 GB machine — the manual line-by-line parser we had before was
+        # functionally similar but BioPython handles edge cases (multi-line
+        # sequences, unusual headers, encoding issues) more robustly.
+        for record in SeqIO.parse(str(fasta_path), "fasta"):
             n_total += 1
+            seq = str(record.seq).upper()
 
             # ── Filter: length ────────────────────────────────────────────
             if len(seq) > ESM2_MAX_LEN:
@@ -367,9 +344,15 @@ def clean_uniref_fasta(fasta_path: Path, out_dir: Path) -> str:
                 continue
 
             n_passed += 1
+
+            # Parse header: ">UniRef50_XXXX some description"
+            header_parts = record.description.split(None, 1)
+            seq_id       = header_parts[0] if header_parts else record.id
+            description   = header_parts[1] if len(header_parts) > 1 else ""
+
             chunk.append({
                 "seq_id":      seq_id,
-                "description": desc,
+                "description": description,
                 "sequence":    seq,
                 "seq_len":     len(seq),
             })
@@ -383,10 +366,10 @@ def clean_uniref_fasta(fasta_path: Path, out_dir: Path) -> str:
                     f"ambig={n_ambig:,}"
                 )
 
-            # ── Chunk flush guard (64 GB RAM protection) ──────────────────
+            # ── Shard flush (16 GB RAM protection) ────────────────────────
             if len(chunk) >= FASTA_CHUNK_SIZE:
                 part_paths.append(_flush_chunk(chunk, part_idx))
-                chunk    = []
+                chunk    = []   # fresh list — old one was .clear()'d inside _flush
                 part_idx += 1
 
         # Flush any remaining sequences
@@ -443,9 +426,7 @@ MEGA_SCALE_KEEP = [
 def clean_mega_scale_csvs(csv_paths: list[Path], out_dir: Path) -> str:
     """
     ETL for all MegaScale CSV files.  Merges into one parquet.
-    Called from within a ProcessPoolExecutor worker.
     """
-    _set_polars_threads()
     t0   = time.time()
     log.info(f"[MegaScale]  START  {len(csv_paths)} file(s)")
     for p in csv_paths:
@@ -515,23 +496,7 @@ def clean_mega_scale_csvs(csv_paths: list[Path], out_dir: Path) -> str:
         raise
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# PROCESS POOL ENTRY POINTS
-# These thin wrappers are needed because lambda / closures are not picklable
-# across ProcessPoolExecutor workers.
-# ─────────────────────────────────────────────────────────────────────────────
 
-def _run_fireprotdb(args: tuple[str, str]) -> str:
-    return clean_fireprotdb(Path(args[0]), Path(args[1]))
-
-def _run_clinvar(args: tuple[str, str]) -> str:
-    return clean_clinvar_vcf(Path(args[0]), Path(args[1]))
-
-def _run_uniref(args: tuple[str, str]) -> str:
-    return clean_uniref_fasta(Path(args[0]), Path(args[1]))
-
-def _run_mega_scale(args: tuple[list[str], str]) -> str:
-    return clean_mega_scale_csvs([Path(p) for p in args[0]], Path(args[1]))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -591,10 +556,10 @@ def main(input_dir: str, output_dir: str) -> None:
     out      = Path(output_dir)
 
     log.info("=" * 70)
-    log.info("  Holo-GNN  Master ETL Pipeline  — V5.0")
+    log.info("  Holo-GNN  Master ETL Pipeline  — V5.0  (Local 16 GB Edition)")
     log.info(f"  Input  : {inp}")
     log.info(f"  Output : {out}")
-    log.info(f"  Workers: {MAX_WORKERS}  (of 16 vCPUs)")
+    log.info(f"  Mode   : single-threaded sequential (no multiprocessing)")
     log.info("=" * 70)
 
     # ── Validate input directory ──────────────────────────────────────────────
@@ -618,53 +583,55 @@ def main(input_dir: str, output_dir: str) -> None:
         else:
             log.warning(f"  {task_name:15s}  NO FILES FOUND — will skip.")
 
-    # ── Build job list for ProcessPoolExecutor ────────────────────────────────
-    # Each job is (worker_fn, args_tuple) — args must be serialisable strings.
-    jobs: list[tuple] = []
-
-    if tasks["fireprotdb"]:
-        for fp in tasks["fireprotdb"]:
-            jobs.append((_run_fireprotdb, (str(fp), str(out))))
-
-    if tasks["clinvar"]:
-        for fp in tasks["clinvar"]:
-            jobs.append((_run_clinvar, (str(fp), str(out))))
-
-    if tasks["uniref"]:
-        for fp in tasks["uniref"]:
-            jobs.append((_run_uniref, (str(fp), str(out))))
-
-    if tasks["mega_scale"]:
-        # All MegaScale CSVs run together in one worker (they share a schema)
-        jobs.append((_run_mega_scale,
-                     ([str(p) for p in tasks["mega_scale"]], str(out))))
-
-    if not jobs:
-        log.error("No recognised input files found. Exiting.")
-        sys.exit(1)
-
-    log.info(f"\nSubmitting {len(jobs)} job(s) to ProcessPoolExecutor "
-             f"(max_workers={MAX_WORKERS}) …\n")
-
-    # ── Execute in parallel ───────────────────────────────────────────────────
+    # ── Execute sequentially (single-threaded, 16 GB safe) ────────────────────
     results:  list[str] = []
     failures: list[str] = []
+    n_tasks = sum(1 for v in tasks.values() if v)
 
-    with ProcessPoolExecutor(max_workers=MAX_WORKERS) as pool:
-        future_map = {
-            pool.submit(fn, args): fn.__name__
-            for fn, args in jobs
-        }
+    log.info(f"\nRunning {n_tasks} cleaner(s) sequentially …\n")
 
-        for future in as_completed(future_map):
-            job_name = future_map[future]
+    # 1. FireProtDB
+    if tasks["fireprotdb"]:
+        for fp in tasks["fireprotdb"]:
             try:
-                result = future.result()
-                results.append(result)
+                results.append(clean_fireprotdb(fp, out))
             except Exception as exc:
-                msg = f"{job_name} FAILED: {exc}"
+                msg = f"clean_fireprotdb FAILED: {exc}"
                 log.error(msg)
                 failures.append(msg)
+        gc.collect()
+
+    # 2. ClinVar
+    if tasks["clinvar"]:
+        for fp in tasks["clinvar"]:
+            try:
+                results.append(clean_clinvar_vcf(fp, out))
+            except Exception as exc:
+                msg = f"clean_clinvar_vcf FAILED: {exc}"
+                log.error(msg)
+                failures.append(msg)
+        gc.collect()
+
+    # 3. UniRef50 (largest — runs last among streamers so prior data is freed)
+    if tasks["uniref"]:
+        for fp in tasks["uniref"]:
+            try:
+                results.append(clean_uniref_fasta(fp, out))
+            except Exception as exc:
+                msg = f"clean_uniref_fasta FAILED: {exc}"
+                log.error(msg)
+                failures.append(msg)
+        gc.collect()
+
+    # 4. MegaScale
+    if tasks["mega_scale"]:
+        try:
+            results.append(clean_mega_scale_csvs(tasks["mega_scale"], out))
+        except Exception as exc:
+            msg = f"clean_mega_scale_csvs FAILED: {exc}"
+            log.error(msg)
+            failures.append(msg)
+        gc.collect()
 
     # ── Final report ──────────────────────────────────────────────────────────
     log.info("\n" + "=" * 70)
