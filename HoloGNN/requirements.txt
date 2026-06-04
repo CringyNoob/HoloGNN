@@ -1,0 +1,11 @@
+torch
+transformers
+torch-geometric
+pandas
+scipy
+scikit-learn
+tqdm
+biopython
+matplotlib
+seaborn
+numpy

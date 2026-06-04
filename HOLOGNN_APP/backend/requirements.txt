@@ -1,0 +1,11 @@
+# Holo-GNN backend — lightweight HTTP layer dependencies
+fastapi
+uvicorn[standard]
+requests
+numpy
+pydantic
+
+# Optional heavy stack (torch, transformers, torch-geometric) is needed only for
+# FULL (non-demo) inference mode. Those packages are listed in:
+#   ../../HoloGNN/requirements.txt
+# Install them separately if you have trained weights and want real predictions.
