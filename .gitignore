@@ -1,9 +1,11 @@
-# --- 1. CORE DATA PROTECTION (The "Data" Folder) ---
-# This single line protects 95% of your files (csv, zip, xml, sptxt inside data)
+# --- 1. CORE DATA PROTECTION (The Data Folders) ---
+# Protects the raw files and the massive ETL output shards
 data/
+CLEANED_DATA/
+pandoc_dir/
 
 # --- 2. SPECIFIC LARGE FILE EXTENSIONS (Safety Net) ---
-# In case you accidentally save data outside the data/ folder
+# In case data is accidentally saved in the root directory
 *.sptxt
 *.csv
 *.tsv
@@ -13,6 +15,7 @@ data/
 *.fasta
 *.fastq
 *.xml
+*.parquet
 
 # --- 3. MODEL WEIGHTS (The Heavy Brains) ---
 # Prevent uploading 100MB+ model files
@@ -26,12 +29,12 @@ __pycache__/
 *.pyc
 
 # --- 5. OS & EDITOR JUNK ---
-# Mac/Windows artifacts seen in your scan
+# Mac/Windows artifacts
 .DS_Store
 __MACOSX/
 Thumbs.db
 .vscode/
 
 # --- 6. SPECIFIC DEBUG IMAGES ---
-# We ignore the scratchpad plot, but KEEP the final result figures (Figure_*.png)
+# Ignore the scratchpad plot, but KEEP the final result figures (Figure_*.png)
 debug_plot.png
