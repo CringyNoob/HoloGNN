@@ -226,7 +226,7 @@ def pretrain(
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--parquet_dir", "-d", default="CLEANED_DATA/")
-    parser.add_argument("--output", "-o", default="uniref_pretrained_weights.pth")
+    parser.add_argument("--output", "-o", dest="output_path", default="uniref_pretrained_weights.pth")
     parser.add_argument("--epochs", type=int, default=3)
     parser.add_argument("--batch_size", type=int, default=16)
     parser.add_argument("--max_length", type=int, default=512)
