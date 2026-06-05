@@ -36,14 +36,14 @@ try:
     from torch_geometric.nn import GATv2Conv
     _PYGEO_AVAILABLE = True
     _GAT_CLS         = GATv2Conv
-    print("✅ torch_geometric GATv2Conv available — V5.0 dynamic attention ENABLED.")
+    print("[OK] torch_geometric GATv2Conv available -- V5.0 dynamic attention ENABLED.")
 except ImportError:
     try:
         # Fallback to GATConv (V3/V4 behaviour) if GATv2 not present
         from torch_geometric.nn import GATConv as GATv2Conv
         _PYGEO_AVAILABLE = True
         _GAT_CLS         = GATv2Conv
-        print("⚠️  GATv2Conv not found — falling back to GATConv (V3.0 behaviour).")
+        print("[WARN] GATv2Conv not found -- falling back to GATConv (V3.0 behaviour).")
     except ImportError:
         print("Warning: torch_geometric not found. GNN layers will be disabled.")
         GATv2Conv        = None
