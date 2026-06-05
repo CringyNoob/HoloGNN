@@ -2,21 +2,6 @@
 pretrain_uniref.py
 ==================
 Holo-GNN — Unsupervised GATv2 Pre-Training via Masked Language Modeling
-
-Objective
----------
-Teach the GATv2 backbone the rules of protein folding *before* fine-tuning on
-labelled stability / pathogenicity data. We use a BERT-style Masked Language
-Modeling (MLM) objective over UniRef50.
-
-Usage
------
-  python pretrain_uniref.py \
-      --parquet_dir "CLEANED_DATA/" \
-      --output      "uniref_pretrained_weights.pth" \
-      --epochs      3 \
-      --batch_size  32 \
-      --max_length  512
 """
 from __future__ import annotations
 
@@ -122,11 +107,11 @@ def pretrain(
     parquet_dir:  str,
     output_path:  str,
     epochs:       int   = 3,
-    batch_size:   int   = 32,
+    batch_size:   int   = 16,
     max_length:   int   = 512,
     lr:           float = 1e-4,
     weight_decay: float = 0.01,
-    num_workers:  int   = 2,
+    num_workers:  int   = 0,
     grad_clip:    float = 1.0,
     log_interval: int   = 100,
     resume_from:  Optional[str] = None,
@@ -145,8 +130,14 @@ def pretrain(
 
     dataset = UniRefDataset(parquet_dir=parquet_dir, max_length=max_length, shuffle_shards=True)
     loader = DataLoader(
-        dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers,
-        pin_memory=True, persistent_workers=True, prefetch_factor=2, drop_last=True,
+        dataset, 
+        batch_size=batch_size, 
+        shuffle=True, 
+        num_workers=num_workers,
+        pin_memory=False, 
+        persistent_workers=(num_workers > 0), 
+        prefetch_factor=2 if num_workers > 0 else None, 
+        drop_last=True,
     )
     total_steps = len(loader) * epochs
 
@@ -175,6 +166,9 @@ def pretrain(
         t_epoch = time.time()
 
         for step, batch in enumerate(loader, 1):
+            if step == 1:
+                log.info("🔥 BATCH 1 SUCCESSFULLY LOADED! The engine is firing.")
+
             input_ids      = batch["input_ids"].to(device, non_blocking=True)
             attention_mask = batch["attention_mask"].to(device, non_blocking=True)
             mech_features  = batch["mechanistic_features"].to(device, non_blocking=True)
@@ -234,11 +228,11 @@ if __name__ == "__main__":
     parser.add_argument("--parquet_dir", "-d", default="CLEANED_DATA/")
     parser.add_argument("--output", "-o", default="uniref_pretrained_weights.pth")
     parser.add_argument("--epochs", type=int, default=3)
-    parser.add_argument("--batch_size", type=int, default=32)
+    parser.add_argument("--batch_size", type=int, default=16)
     parser.add_argument("--max_length", type=int, default=512)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--weight_decay", type=float, default=0.01)
-    parser.add_argument("--num_workers", type=int, default=2)
+    parser.add_argument("--num_workers", type=int, default=0)
     parser.add_argument("--grad_clip", type=float, default=1.0)
     parser.add_argument("--log_interval", type=int, default=100)
     parser.add_argument("--resume_from", type=str, default=None)
