@@ -297,7 +297,7 @@ def discover_inputs(input_dir: Path) -> dict[str, list[Path]]:
             p, stem, ext = dirpath / fname, fname.lower(), Path(fname).suffix.lower()
             if "fireprotdb" in stem and ext == ".csv": tasks["fireprotdb"].append(p)
             elif "clinvar" in stem and ext == ".vcf": tasks["clinvar"].append(p)
-            elif "uniref" in stem and ext in {".fasta", ".fa"}: tasks["uniref"].append(p)
+            elif "uniref" in stem and ext in {".fasta", ".fa", ".gz"}: tasks["uniref"].append(p)
             elif ext == ".csv" and any(kw in stem for kw in ["tsuboyama", "lib1_k50", "lib2_k50", "lib3_k50", "lib4_k50"]):
                 tasks["mega_scale"].append(p)
     return tasks
