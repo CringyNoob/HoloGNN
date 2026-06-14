@@ -146,6 +146,93 @@ def classification_metrics(y_true, y_prob, threshold: float = 0.5) -> Dict[str, 
 
 
 # ---------------------------------------------------------------------------
+# Threshold selection (classification)
+# ---------------------------------------------------------------------------
+def best_threshold(y_true, y_prob, objective: str = "mcc") -> Dict[str, float]:
+    """Pick the decision threshold that maximizes ``objective`` on these data.
+
+    The fixed 0.5 cut is rarely optimal for an imbalanced or proxy score.  We
+    sweep candidate thresholds (the unique predicted scores) and return the best
+    threshold plus the value it achieves.  ``objective`` ∈ {"mcc","f1"}.
+
+    Returns ``{"threshold": t, "<objective>": value}``.  NaN when one class only.
+    """
+    yt = _as_1d(y_true)
+    yp = _as_1d(y_prob)
+    n = min(len(yt), len(yp))
+    yt, yp = (yt[:n] >= 0.5).astype(int), yp[:n]
+    out = {"threshold": 0.5, objective: float("nan")}
+    if n == 0 or not (0 < yt.sum() < n):
+        return out
+    try:
+        from sklearn.metrics import f1_score, matthews_corrcoef
+        score_fn = matthews_corrcoef if objective == "mcc" else (
+            lambda a, b: f1_score(a, b, zero_division=0))
+    except ImportError:  # pragma: no cover
+        return out
+
+    # Candidate thresholds: midpoints between sorted unique scores (+ endpoints).
+    cands = np.unique(yp)
+    if len(cands) > 512:                       # cap cost on large eval sets
+        cands = np.quantile(yp, np.linspace(0, 1, 512))
+    best_t, best_v = 0.5, -np.inf
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        for t in cands:
+            v = float(score_fn(yt, (yp >= t).astype(int)))
+            if v > best_v:
+                best_v, best_t = v, float(t)
+    return {"threshold": best_t, objective: best_v}
+
+
+# ---------------------------------------------------------------------------
+# Bootstrap confidence intervals
+# ---------------------------------------------------------------------------
+def bootstrap_ci(
+    y_true,
+    y_pred,
+    *,
+    kind: str = "regression",
+    metrics: Sequence[str] = ("pearson", "spearman", "rmse"),
+    n_boot: int = 1000,
+    alpha: float = 0.05,
+    seed: int = 42,
+    threshold: float = 0.5,
+) -> Dict[str, list]:
+    """Percentile bootstrap CIs for the requested metrics.
+
+    Resamples (y_true, y_pred) pairs with replacement ``n_boot`` times and
+    returns ``{metric: [lo, hi]}`` at the ``(1-alpha)`` level.  ``kind`` selects
+    the metric family ("regression" or "classification").
+    """
+    yt, yp = _as_1d(y_true), _as_1d(y_pred)
+    n = min(len(yt), len(yp))
+    yt, yp = yt[:n], yp[:n]
+    out: Dict[str, list] = {m: [float("nan"), float("nan")] for m in metrics}
+    if n < 2:
+        return out
+
+    metric_fn = (regression_metrics if kind == "regression"
+                 else (lambda a, b: classification_metrics(a, b, threshold=threshold)))
+    rng = np.random.default_rng(seed)
+    samples: Dict[str, list] = {m: [] for m in metrics}
+    for _ in range(n_boot):
+        idx = rng.integers(0, n, size=n)
+        res = metric_fn(yt[idx], yp[idx])
+        for m in metrics:
+            v = res.get(m, float("nan"))
+            if not (isinstance(v, float) and math.isnan(v)):
+                samples[m].append(v)
+
+    lo_q, hi_q = 100 * (alpha / 2), 100 * (1 - alpha / 2)
+    for m in metrics:
+        if samples[m]:
+            out[m] = [float(np.percentile(samples[m], lo_q)),
+                      float(np.percentile(samples[m], hi_q))]
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Pretty printing
 # ---------------------------------------------------------------------------
 _LABELS = {
@@ -156,8 +243,14 @@ _LABELS = {
 }
 
 
-def format_report(metrics: Dict[str, float], title: str = "Metrics") -> str:
-    """Render a metrics dict as an aligned multi-line block for the console."""
+def format_report(metrics: Dict[str, float], title: str = "Metrics",
+                  ci: Dict[str, list] | None = None) -> str:
+    """Render a metrics dict as an aligned multi-line block for the console.
+
+    If ``ci`` (``{metric: [lo, hi]}`` from :func:`bootstrap_ci`) is supplied, the
+    95% interval is appended next to the relevant metrics.
+    """
+    ci = ci or {}
     lines = [f"=== {title} ==="]
     for key, val in metrics.items():
         label = _LABELS.get(key, key)
@@ -166,8 +259,13 @@ def format_report(metrics: Dict[str, float], title: str = "Metrics") -> str:
         elif isinstance(val, float) and math.isnan(val):
             lines.append(f"  {label:<14}: n/a")
         else:
-            lines.append(f"  {label:<14}: {val:.4f}")
+            suffix = ""
+            bounds = ci.get(key)
+            if bounds and not any(math.isnan(b) for b in bounds):
+                suffix = f"   [95% CI {bounds[0]:.4f} to {bounds[1]:.4f}]"
+            lines.append(f"  {label:<14}: {val:.4f}{suffix}")
     return "\n".join(lines)
 
 
-__all__ = ["regression_metrics", "classification_metrics", "format_report"]
+__all__ = ["regression_metrics", "classification_metrics", "format_report",
+           "bootstrap_ci", "best_threshold"]

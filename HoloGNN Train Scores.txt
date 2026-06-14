@@ -1,0 +1,74 @@
+(.venv) PS F:\Projects\HoloGNN\HoloGNN> python train_siamese.py
+✅ torch_geometric GATv2Conv available — V5.0 dynamic attention ENABLED.
+--- SIAMESE ΔΔG TRAINING ---
+[device] CUDA: NVIDIA GeForce RTX 5070 Ti  (sm_120, 15.9 GB, torch 2.11.0+cu128)
+Loading weights: 100%|█████████████████████████████████████████████████████████████████████████████████████████████████| 102/102 [00:00<00:00, 11330.55it/s]
+[transformers] EsmModel LOAD REPORT from: facebook/esm2_t6_8M_UR50D
+Key                       | Status     | 
+--------------------------+------------+-
+lm_head.layer_norm.bias   | UNEXPECTED | 
+lm_head.dense.bias        | UNEXPECTED | 
+lm_head.layer_norm.weight | UNEXPECTED | 
+lm_head.dense.weight      | UNEXPECTED | 
+lm_head.bias              | UNEXPECTED | 
+pooler.dense.weight       | MISSING    | 
+pooler.dense.bias         | MISSING    | 
+
+Notes:
+- UNEXPECTED:   can be ignored when loading from different task/architecture; not ok if you expect identical arch.
+- MISSING:      those params were newly initialized because missing from the checkpoint. Consider training on your downstream task.
+Loading FireProtDB data from megascale_ddg_pairs.parquet …
+  120,000 mutations loaded  (full sequences: yes)
+Train: 108,000 pairs | Val: 12,000 pairs
+Epoch 1/5: 100%|██████████████████████████████████████████████████████████████████████| 3375/3375 [08:54<00:00,  6.31it/s, loss=2.29, anti=0.0267, fid=2.26]
+Epoch 1: val_loss = 1.5499
+=== Epoch 1 validation (ΔΔG) ===
+  N             : 12000
+  Pearson r     : 0.8528
+  Spearman rho  : 0.8240
+  RMSE          : 1.2403
+  MAE           : 0.8159
+  R^2           : 0.7250
+  checkpoint saved → holognn_stability_final.pth
+Epoch 2/5: 100%|██████████████████████████████████████████████████████████████████████| 3375/3375 [09:04<00:00,  6.20it/s, loss=1.32, anti=0.0105, fid=1.31]
+Epoch 2: val_loss = 1.3294
+=== Epoch 2 validation (ΔΔG) ===
+  N             : 12000
+  Pearson r     : 0.8757
+  Spearman rho  : 0.8501
+  RMSE          : 1.1491
+  MAE           : 0.7381
+  R^2           : 0.7640
+  checkpoint saved → holognn_stability_final.pth
+Epoch 3/5: 100%|█████████████████████████████████████████████████████████████████████| 3375/3375 [09:01<00:00,  6.23it/s, loss=1.05, anti=0.00891, fid=1.04]
+Epoch 3: val_loss = 1.2441
+=== Epoch 3 validation (ΔΔG) ===
+  N             : 12000
+  Pearson r     : 0.8846
+  Spearman rho  : 0.8631
+  RMSE          : 1.1117
+  MAE           : 0.7274
+  R^2           : 0.7791
+  checkpoint saved → holognn_stability_final.pth
+Epoch 4/5: 100%|███████████████████████████████████████████████████████████████████| 3375/3375 [08:54<00:00,  6.32it/s, loss=0.862, anti=0.00715, fid=0.855]
+Epoch 4: val_loss = 1.2070
+=== Epoch 4 validation (ΔΔG) ===
+  N             : 12000
+  Pearson r     : 0.8897
+  Spearman rho  : 0.8617
+  RMSE          : 1.0957
+  MAE           : 0.6994
+  R^2           : 0.7854
+  checkpoint saved → holognn_stability_final.pth
+Epoch 5/5: 100%|█████████████████████████████████████████████████████████████████████| 3375/3375 [09:01<00:00,  6.23it/s, loss=0.716, anti=0.0064, fid=0.71]
+Epoch 5: val_loss = 1.1498
+=== Epoch 5 validation (ΔΔG) ===
+  N             : 12000
+  Pearson r     : 0.8929
+  Spearman rho  : 0.8671
+  RMSE          : 1.0697
+  MAE           : 0.6915
+  R^2           : 0.7955
+  checkpoint saved → holognn_stability_final.pth
+--- COMPLETE in 0.80 h ---
+(.venv) PS F:\Projects\HoloGNN\HoloGNN> 

@@ -14,6 +14,7 @@ from src.heads import ProteomicsHead
 from src.dataset import mechanistic_features_for_protein
 from src.device import describe_device
 from src.metrics import classification_metrics, format_report
+from src.checkpoint import save_checkpoint, load_checkpoint
 from transformers import EsmTokenizer
 
 MAX_LENGTH = 100
@@ -73,10 +74,10 @@ def train_proteomics():
     print("Loading Pre-trained Physics Brain...")
     model = HoloGNN()
     try:
-        model.load_state_dict(torch.load(STABILITY_MODEL_PATH, map_location=device), strict=False)
-        print("✅ Stability weights loaded.")
+        _, meta = load_checkpoint(STABILITY_MODEL_PATH, model, device, strict=False)
+        print(f"[ok] Backbone weights loaded (source task: {meta.get('trained_task')}).")
     except FileNotFoundError:
-        print("❌ CRITICAL: Stability weights not found!")
+        print("[fatal] Stability weights not found!")
         return
 
     # 2. Reset Head (fresh classifier head, routed via task="proteomics")
@@ -148,7 +149,8 @@ def train_proteomics():
                             f"Epoch {epoch+1} (disease classification)"))
 
     print("--- SUCCESS! MODEL SAVED. ---")
-    torch.save(model.state_dict(), "holognn_disease_classifier.pth")
+    save_checkpoint("holognn_disease_classifier.pth", model,
+                    trained_task="proteomics", trained_heads=["proteomics_head"])
 
 if __name__ == "__main__":
     train_proteomics()

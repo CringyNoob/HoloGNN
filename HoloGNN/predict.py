@@ -49,6 +49,7 @@ def _try_load_model():
         import torch
         from transformers import EsmTokenizer
         from src.full_model import HoloGNN
+        from src.checkpoint import load_checkpoint
     except Exception as exc:  # noqa: BLE001
         print(f"[demo] inference stack unavailable ({exc.__class__.__name__}); using heuristic.")
         return None
@@ -57,7 +58,13 @@ def _try_load_model():
     device = describe_device()
     model = HoloGNN()
     try:
-        model.load_state_dict(torch.load(MODEL_PATH, map_location=device))
+        _, meta = load_checkpoint(MODEL_PATH, model, device, strict=False)
+        # predict.py runs the Siamese ΔΔG path; warn if this checkpoint's head
+        # for that path was never trained (would yield meaningless predictions).
+        trained = meta.get("trained_heads")
+        if trained is not None and "siamese_head" not in trained:
+            print(f"[warn] {MODEL_PATH} was trained for {meta.get('trained_task')!r} "
+                  f"(heads={trained}); the Siamese ΔΔG head may be untrained.")
     except Exception as exc:  # noqa: BLE001
         print(f"[demo] could not load weights from {MODEL_PATH} ({exc}); using heuristic.")
         return None

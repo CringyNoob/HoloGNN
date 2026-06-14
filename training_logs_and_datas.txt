@@ -1,0 +1,1 @@
+currently we have trained Siamese head with 108k data out of 1.08 million data (5 epochs)

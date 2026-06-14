@@ -132,6 +132,7 @@ class HoloGNN(nn.Module):
             'stability'   → Tensor (B, 1)   single-sequence absolute ΔG
             'mfi'         → Tensor (B, 1)   mean fluorescence intensity
             'idr'         → tuple( dG_wt_to_mt (B,1), dG_mt_to_wt (B,1) )
+            'pathogenicity'→ Tensor (B,)    pathogenicity logit (ClinVar)
             'three_state' → Tensor (B, 3)   class logits (destab/neutral/stab)
             default       → Tensor (B, 320) raw embedding
         """
@@ -166,6 +167,21 @@ class HoloGNN(nn.Module):
             z_wt = self._encode(data_wt)
             z_mt = self._encode(data_mt)
             return self.three_state_head(z_wt, z_mt)   # (B, 3) logits
+
+        # ------------------------------------------------------------------
+        # Task: pathogenicity  — ClinVar benign/pathogenic CLASSIFICATION.
+        #   data is a (data_wt, data_mt) tuple (REF / ALT allele contexts).
+        #   Uses the dedicated EnsembleIDRHead on the Siamese difference embedding
+        #   to emit a single pathogenicity logit, so it can be trained directly on
+        #   ClinVar labels (BCEWithLogitsLoss) instead of reusing the ΔΔG head as a
+        #   sigmoid(-ΔΔG) proxy.  Returns raw logits (B,) — apply sigmoid for prob.
+        # ------------------------------------------------------------------
+        if task == "pathogenicity":
+            data_wt, data_mt = data
+            z_wt = self._encode(data_wt)
+            z_mt = self._encode(data_mt)
+            logit, _sigma = self.idr_head(z_mt - z_wt)   # (B, 1)
+            return logit.squeeze(-1)                       # (B,)
 
         # ------------------------------------------------------------------
         # Task: idr  [V4.0 — True Siamese Pass]

@@ -57,6 +57,8 @@ Choices for --figure: all | correlation | confusion | roc | metrics
 
 import os
 import sys
+import json
+import math
 import argparse
 
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
@@ -73,7 +75,8 @@ from sklearn.metrics import confusion_matrix, roc_curve, auc, roc_auc_score
 # ---------------------------------------------------------------------------
 # Output directory
 # ---------------------------------------------------------------------------
-IMAGES_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "images")
+ROOT       = os.path.dirname(os.path.abspath(__file__))
+IMAGES_DIR = os.path.join(ROOT, "images")
 
 # ---------------------------------------------------------------------------
 # Published cached metrics used in DEMO mode
@@ -92,6 +95,74 @@ _ASYM_MEAN       = 0.7408   # kcal/mol, mean |dG_fwd + dG_rev|
 _EPOCHS          = 5        # training epochs for the multi-panel loss curves
 
 TEAL = "#008080"            # accent colour
+
+
+# ===========================================================================
+# Real-metrics ingestion — prefer evaluate.py's metrics_<task>.json over the
+# stale published constants above, so the figures reconstruct the *measured*
+# performance of the current checkpoint.
+# ===========================================================================
+def _read_metrics_json(task: str):
+    """Return the metrics dict from ``metrics_<task>.json`` (or None)."""
+    path = os.path.join(ROOT, f"metrics_{task}.json")
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path) as f:
+            payload = json.load(f)
+        return payload.get("metrics", payload)
+    except Exception as exc:  # noqa: BLE001
+        print(f"  [metrics-json] could not read {path}: {exc}")
+        return None
+
+
+def _finite(x):
+    return isinstance(x, (int, float)) and not (isinstance(x, float) and math.isnan(x))
+
+
+def apply_real_metrics() -> list:
+    """Override the cached demo constants with real measured metrics, in place.
+
+    Returns the list of tasks whose JSON was found.  The demo synthesisers then
+    reconstruct scatter/ROC/CM that match the *actual* evaluation numbers.
+    """
+    global _STABILITY_R, _STABILITY_RMSE, _STABILITY_MAE, _N_STABILITY
+    global _ROC_AUC_TARGET, _CM_TN, _CM_FP, _CM_FN, _CM_TP
+    used = []
+
+    s = _read_metrics_json("stability") or _read_metrics_json("ddg")
+    if s:
+        if _finite(s.get("pearson")):
+            _STABILITY_R = max(-0.999, min(0.999, float(s["pearson"])))
+        if _finite(s.get("rmse")):
+            _STABILITY_RMSE = float(s["rmse"])
+        if _finite(s.get("mae")):
+            _STABILITY_MAE = float(s["mae"])
+        if _finite(s.get("n")):
+            _N_STABILITY = int(s["n"])
+        used.append("stability")
+
+    p = _read_metrics_json("pathogenicity")
+    if p:
+        if _finite(p.get("auroc")):
+            _ROC_AUC_TARGET = float(p["auroc"])
+        # Reconstruct a confusion matrix consistent with the reported
+        # n / pos_rate / recall / precision (evaluate.py doesn't store raw TN…TP).
+        n = int(p.get("n", 0))
+        if n and _finite(p.get("pos_rate")):
+            n_pos = round(float(p["pos_rate"]) * n)
+            n_neg = n - n_pos
+            recall = float(p["recall"]) if _finite(p.get("recall")) else 0.0
+            prec   = float(p["precision"]) if _finite(p.get("precision")) else 0.0
+            tp = round(recall * n_pos)
+            fn = n_pos - tp
+            fp = round(tp * (1 - prec) / prec) if prec > 1e-9 else 0
+            fp = min(fp, n_neg)
+            tn = n_neg - fp
+            _CM_TN, _CM_FP, _CM_FN, _CM_TP = tn, fp, fn, tp
+        used.append("pathogenicity")
+
+    return used
 
 
 # ===========================================================================
@@ -541,6 +612,18 @@ def main():
 
     # Ensure output directory exists
     os.makedirs(IMAGES_DIR, exist_ok=True)
+
+    # -----------------------------------------------------------------
+    # Prefer real measured metrics from evaluate.py (metrics_<task>.json)
+    # -----------------------------------------------------------------
+    real = apply_real_metrics()
+    if real:
+        print(f"[metrics] using measured metrics from metrics_{{{','.join(real)}}}.json:")
+        print(f"[metrics]   stability r={_STABILITY_R:.4f} RMSE={_STABILITY_RMSE:.4f} "
+              f"MAE={_STABILITY_MAE:.4f} | ROC-AUC={_ROC_AUC_TARGET:.4f}")
+    else:
+        print("[metrics] no metrics_<task>.json found; using cached published constants. "
+              "Run evaluate.py first to drive figures from real results.")
 
     # -----------------------------------------------------------------
     # Attempt FULL mode

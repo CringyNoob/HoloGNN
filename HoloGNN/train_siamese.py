@@ -24,22 +24,28 @@ os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 import time
 import torch
 import torch.optim as optim
-from torch.utils.data import DataLoader, random_split
-from tqdm import tqdm
+from torch.utils.data import DataLoader, Subset
 
 from src.dataset import FireProtDataset
 from src.full_model import HoloGNN
 from src.loss import AntisymmetricLoss
 from src.device import describe_device
 from src.metrics import regression_metrics, format_report
+from src.splits import split_indices, DEFAULT_SEED
+from src.checkpoint import save_checkpoint
 
 # --- CONFIGURATION ---
-DATA_PATH     = "data/fireprotdb/fireprotdb_clean.parquet"
-BATCH_SIZE    = 8
+# NOTE: FireProtDB clean has NO sequences (SOURCE/TARGET all empty) → train on the
+# MegaScale-derived WT/MT pairs built by build_megascale_pairs.py instead.
+DATA_PATH     = "data/megascale_siamese/megascale_ddg_pairs.parquet"
+BATCH_SIZE    = 32           # RTX 5070 Ti (16GB) easily fits this for ESM2-8M
+NUM_WORKERS   = 0            # raise to 4 on WSL/Linux for a big data-loading speedup
+LOG_EVERY     = 25           # print a plain progress line every N steps
 LEARNING_RATE = 1e-4
 EPOCHS        = 5
 ALPHA         = 1.0          # antisymmetry-term weight
-SAVE_PATH     = "holognn_stability_final.pth"
+SPLIT_SEED    = DEFAULT_SEED  # shared with evaluate.py for a disjoint test split
+SAVE_PATH     = "holognn_stability_final.pth"   # the file the app / predict.py load
 
 
 def _make_batch(batch, suffix, device):
@@ -63,19 +69,27 @@ def train():
     optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
 
     dataset = FireProtDataset(DATA_PATH)
-    n_val   = max(1, int(0.1 * len(dataset)))
-    n_train = len(dataset) - n_val
-    train_ds, val_ds = random_split(dataset, [n_train, n_val])
-    train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, num_workers=0)
-    val_loader   = DataLoader(val_ds,   batch_size=BATCH_SIZE, num_workers=0)
+    # Deterministic, leakage-free split shared with evaluate.py (src/splits.py):
+    # evaluate.py's disjoint 'test' partition removes the train/eval overlap the
+    # old unseeded random_split caused for the ddg/pathogenicity tasks.
+    n_total = len(dataset)
+    splits  = split_indices(n_total, seed=SPLIT_SEED)
+    train_ds = Subset(dataset, splits["train"].tolist())
+    val_ds   = Subset(dataset, splits["val"].tolist())
+    n_train, n_val = len(train_ds), len(val_ds)
+    train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True,
+                              num_workers=NUM_WORKERS, pin_memory=True)
+    val_loader   = DataLoader(val_ds,   batch_size=BATCH_SIZE,
+                              num_workers=NUM_WORKERS, pin_memory=True)
     print(f"Train: {n_train:,} pairs | Val: {n_val:,} pairs")
 
     start = time.time()
     for epoch in range(EPOCHS):
         model.train()
         run_loss = run_anti = run_fid = 0.0
-        bar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{EPOCHS}")
-        for batch in bar:
+        n_steps = len(train_loader)
+        t_ep = time.time()
+        for step, batch in enumerate(train_loader, 1):
             data_wt = _make_batch(batch, "wt", device)
             data_mt = _make_batch(batch, "mt", device)
             labels  = batch["label"].to(device)
@@ -87,8 +101,11 @@ def train():
             optimizer.step()
 
             run_loss += loss.item(); run_anti += comp["antisymmetry"]; run_fid += comp["fidelity"]
-            n = bar.n + 1
-            bar.set_postfix({"loss": run_loss/n, "anti": run_anti/n, "fid": run_fid/n})
+            if step % LOG_EVERY == 0 or step == n_steps:
+                rate = step / max(time.time() - t_ep, 1e-9)
+                print(f"  Epoch {epoch+1}/{EPOCHS} | step {step}/{n_steps} | "
+                      f"loss={run_loss/step:.4f} anti={run_anti/step:.4f} fid={run_fid/step:.4f} | "
+                      f"{rate:.1f} it/s", flush=True)
 
         # --- validation: loss + held-out ΔΔG regression metrics ---
         model.eval()
@@ -106,10 +123,12 @@ def train():
                 val_labels.extend(labels.detach().cpu().tolist())
         print(f"Epoch {epoch+1}: val_loss = {val_loss/max(1,len(val_loader)):.4f}")
         print(format_report(regression_metrics(val_labels, val_preds),
-                            f"Epoch {epoch+1} validation (ΔΔG)"))
+                            f"Epoch {epoch+1} validation (ddG)"))
 
-        torch.save(model.state_dict(), SAVE_PATH)
-        print(f"  checkpoint saved → {SAVE_PATH}")
+        save_checkpoint(SAVE_PATH, model, trained_task="idr",
+                        trained_heads=["siamese_head"], split_seed=SPLIT_SEED,
+                        dataset_n=n_total)
+        print(f"  checkpoint saved -> {SAVE_PATH}")
 
     print(f"--- COMPLETE in {(time.time()-start)/3600:.2f} h ---")
 
