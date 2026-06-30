@@ -1,22 +1,17 @@
 """
 src/dataset.py
 ==============
-HoloGNN Dataset Classes — Evolution History
---------------------------------------------
-V1.0  Basic DNA→Protein translation; returns input_ids, attention_mask, label.
-V3.0  Mechanistic Injection: mock proxy features.
-V5.0  True Biological Features: real CAI, H-H charge, GC-skew mRNA fold.
-V6.0  Multi-Task Routing: three new dataset classes for the full Holo-GNN
-      multi-task training pipeline, plus a MultiTaskBatchSampler for head routing.
+HoloGNN Dataset Classes.
 
-      New classes:
-          ClinVarDataset   — IDR Classification Head  (pathogenic / benign)
-          FireProtDataset  — Siamese Stability Head   (ΔΔG regression)
-          UniRefDataset    — Pre-training / MLM        (streaming parquet shards)
+Dataset classes:
+    MassIVEKBDataset   — Proteomics pre-training (MassIVE-KB .sptxt files)
+    MegaScaleDataset   — Single-sequence ΔG stability (MegaScale cDNA)
+    ClinVarDataset     — Pathogenicity classification (ClinVar VCF)
+    FireProtDataset    — Siamese ΔΔG stability regression (FireProtDB)
+    UniRefDataset      — Pre-training / MLM (streaming parquet shards)
 
-      Each class tags every sample with  batch['task']  so the HoloGNN
-      forward pass and loss router can dispatch to the correct head without
-      any external bookkeeping.
+Each class tags every sample with  batch['task']  so the HoloGNN
+forward pass can dispatch to the correct head.
 """
 
 from __future__ import annotations
@@ -33,12 +28,12 @@ from torch.utils.data import Dataset, Sampler
 from transformers import EsmTokenizer
 from Bio.Seq import Seq
 
-# [V6] Reuse the biophysical tables from the heuristics module (stdlib-only).
+# Reuse the biophysical tables from the heuristics module (stdlib-only).
 from src.heuristics import KD_HYDROPATHY, RESIDUE_VOLUME
 
 
 # =============================================================================
-# V5.0 — True CAI: E. coli K-12 codon usage table
+# E. coli K-12 Codon Adaptation Index
 # =============================================================================
 _CODON_CAI_WEIGHT: dict[str, float] = {
     # Phe (F)
@@ -96,7 +91,7 @@ def _cai_per_residue(dna_seq: str, max_length: int) -> list[float]:
 
 
 # =============================================================================
-# V5.0 — True Charge: Henderson-Hasselbalch pKa model at pH 7.4
+# Henderson-Hasselbalch charge at pH 7.4
 # =============================================================================
 _PKA = {
     'D': (3.67,  -1.0), 'E': (4.25,  -1.0),
@@ -129,7 +124,7 @@ def _charge_per_residue(protein_seq: str, max_length: int, window: int = 7) -> l
 
 
 # =============================================================================
-# V5.0 — True mRNA Fold: Codon-level GC-skew × stacking energy proxy
+# Codon-level GC-skew × stacking energy proxy
 # =============================================================================
 _CODON_COMPOSITION: dict[str, tuple[int, int, int, int]] = {}
 
@@ -164,7 +159,7 @@ def _mrna_fold_per_residue(dna_seq: str, max_length: int,
 
 
 # =============================================================================
-# V5.0 — Master mechanistic feature generator
+# Master mechanistic feature generator
 # =============================================================================
 def _mechanistic_features(
     protein_seq: str,
@@ -201,7 +196,7 @@ def _protein_only_mech(protein_seq: str, max_length: int) -> torch.Tensor:
 
 
 # =============================================================================
-# V6 — Expanded protein-only mechanistic channels
+# Expanded protein-only mechanistic channels
 #   Three extra descriptors computable from the amino-acid sequence alone
 #   (no DNA required), enriching the protein-only path (ClinVar, the web UI):
 #     3 = Kyte-Doolittle hydropathy  (normalised to [0, 1])
@@ -240,7 +235,7 @@ def mechanistic_features_for_protein(protein_seq: str,
                                      expanded: bool = False) -> torch.Tensor:
     """
     Public helper for inference: the (max_length, C) mechanistic-feature tensor
-    for a protein-only input (no DNA).  C = 3 (default, V5) or 6 (expanded, V6).
+    for a protein-only input (no DNA).  C = 3 (default) or 6 (expanded).
 
     Used by both ``predict.py`` and the HOLOGNN_APP inference wrapper so the
     features fed to the backbone match those seen during training.
@@ -280,7 +275,7 @@ def _tokenize(tokenizer: EsmTokenizer, seq: str,
 # =============================================================================
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Existing: MassIVEKBDataset
+# MassIVEKBDataset
 # ─────────────────────────────────────────────────────────────────────────────
 class MassIVEKBDataset(Dataset):
     """
@@ -320,13 +315,15 @@ class MassIVEKBDataset(Dataset):
     def __getitem__(self, idx: int) -> dict:
         item = self.data[idx]
         tok  = _tokenize(self.tokenizer, item["seq"], self.max_length)
+        mech = mechanistic_features_for_protein(item["seq"], self.max_length)
         return {**tok,
+                "mechanistic_features": mech,
                 "label": torch.tensor(item["label"], dtype=torch.float),
                 "task":  "proteomics"}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Existing: MegaScaleDataset  (V5.0, unchanged interface)
+# MegaScaleDataset
 # ─────────────────────────────────────────────────────────────────────────────
 class MegaScaleDataset(Dataset):
     """
@@ -334,7 +331,6 @@ class MegaScaleDataset(Dataset):
     Regression target : deltaG (kcal/mol).
     task tag          : 'stability'
 
-    V5.0: true CAI + H-H charge + GC-skew mRNA fold on-the-fly.
     Accepts both raw .csv and pre-cleaned .parquet files.
     """
 
@@ -342,7 +338,7 @@ class MegaScaleDataset(Dataset):
                  expanded_mech: bool = False):
         self.tokenizer     = _get_tokenizer()
         self.max_length    = max_length
-        self.expanded_mech = expanded_mech   # [V6] append protein-only channels → 6
+        self.expanded_mech = expanded_mech
         path = Path(data_path)
 
         print(f"Loading MegaScale data from {path.name} …")
@@ -355,6 +351,13 @@ class MegaScaleDataset(Dataset):
         label_col = "deltaG" if "deltaG" in df.columns else "deltaG_t"
         self.df   = df.dropna(subset=["dna_seq", label_col]).reset_index(drop=True)
         self._label_col = label_col
+
+        # Pre-compute protein translations to avoid repeated Bio.Seq calls
+        print("  Pre-computing protein sequences from DNA...")
+        self._proteins = []
+        for i in range(len(self.df)):
+            dna = str(self.df.iloc[i]["dna_seq"])
+            self._proteins.append(str(Seq(dna).translate(to_stop=True)))
         print(
             f"  {len(self.df):,} valid samples loaded. "
             f"Label column: '{label_col}'"
@@ -366,7 +369,7 @@ class MegaScaleDataset(Dataset):
     def __getitem__(self, idx: int) -> dict:
         row         = self.df.iloc[idx]
         dna_seq     = str(row["dna_seq"])
-        protein_seq = str(Seq(dna_seq).translate(to_stop=True))
+        protein_seq = self._proteins[idx]
         label       = float(row[self._label_col])
         tok         = _tokenize(self.tokenizer, protein_seq, self.max_length)
         mech        = _mechanistic_features(protein_seq, dna_seq, self.max_length)
@@ -383,7 +386,7 @@ class MegaScaleDataset(Dataset):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# V6.0 NEW: ClinVarDataset
+# ClinVarDataset
 # ─────────────────────────────────────────────────────────────────────────────
 class ClinVarDataset(Dataset):
     """
@@ -418,11 +421,12 @@ class ClinVarDataset(Dataset):
     def __init__(
         self,
         parquet_path: str,
-        max_length:   int  = 64,    # ClinVar alleles are short (< 50 nt typically)
-        min_label_balance: float = 0.0,   # set > 0 to oversample minority class
+        max_length:   int  = 64,
+        expanded_mech: bool = False,
     ):
-        self.tokenizer  = _get_tokenizer()
-        self.max_length = max_length
+        self.tokenizer     = _get_tokenizer()
+        self.max_length    = max_length
+        self.expanded_mech = expanded_mech
 
         print(f"Loading ClinVar data from {Path(parquet_path).name} …")
         df = pd.read_parquet(parquet_path)
@@ -461,9 +465,8 @@ class ClinVarDataset(Dataset):
         tok_ref = _tokenize(self.tokenizer, ref, self.max_length)
         tok_alt = _tokenize(self.tokenizer, alt, self.max_length)
 
-        # Mechanistic features: charge-only (no DNA codon context available)
-        mech_ref = _protein_only_mech(ref, self.max_length)
-        mech_alt = _protein_only_mech(alt, self.max_length)
+        mech_ref = mechanistic_features_for_protein(ref, self.max_length, self.expanded_mech)
+        mech_alt = mechanistic_features_for_protein(alt, self.max_length, self.expanded_mech)
 
         return {
             # Wild-type (reference) allele
@@ -481,7 +484,7 @@ class ClinVarDataset(Dataset):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# V6.0 NEW: FireProtDataset
+# FireProtDataset
 # ─────────────────────────────────────────────────────────────────────────────
 class FireProtDataset(Dataset):
     """
@@ -510,7 +513,7 @@ class FireProtDataset(Dataset):
     head only needs the embedding difference, so relative token positions
     still carry the mutation signal.
 
-    task tag : 'stability'
+    task tag : 'idr'
     """
     # Minimum length to treat a string as a full AA sequence vs an accession ID
     _MIN_SEQ_LEN = 10
@@ -523,7 +526,7 @@ class FireProtDataset(Dataset):
     ):
         self.tokenizer     = _get_tokenizer()
         self.max_length    = max_length
-        self.expanded_mech = expanded_mech   # [V6] 3 → 6 mechanistic channels
+        self.expanded_mech = expanded_mech
 
         print(f"Loading FireProtDB data from {Path(parquet_path).name} …")
         df = pd.read_parquet(parquet_path)
@@ -586,12 +589,12 @@ class FireProtDataset(Dataset):
             "mechanistic_features_mt":  mech_mt,
             # Regression label
             "label":                    torch.tensor(ddg, dtype=torch.float),
-            "task":                     "stability",
+            "task":                     "idr",
         }
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# V6.0 NEW: UniRefDataset  (streaming parquet shards)
+# UniRefDataset  (streaming parquet shards)
 # ─────────────────────────────────────────────────────────────────────────────
 class UniRefDataset(Dataset):
     """
@@ -702,13 +705,12 @@ class UniRefDataset(Dataset):
         return {
             **tok,
             "mechanistic_features": mech,
-            "seq_id":               str(row.get("seq_id", "")),
             "task":                 "pretrain",
         }
 
 
 # =============================================================================
-# V6.0 — MultiTaskBatchSampler
+# MultiTaskBatchSampler
 # =============================================================================
 class MultiTaskBatchSampler(Sampler):
     """

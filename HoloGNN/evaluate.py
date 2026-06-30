@@ -85,13 +85,13 @@ def _tail_subset(dataset, max_samples):
 def _build_dataset(task, data_path, max_length):
     if task == "stability":
         from src.dataset import MegaScaleDataset
-        return MegaScaleDataset(data_path, max_length=max_length or 100)
+        return MegaScaleDataset(data_path, max_length=max_length or 100, expanded_mech=True)
     if task == "ddg":
         from src.dataset import FireProtDataset
-        return FireProtDataset(data_path, max_length=max_length or 100)
+        return FireProtDataset(data_path, max_length=max_length or 100, expanded_mech=True)
     if task == "pathogenicity":
         from src.dataset import ClinVarDataset
-        return ClinVarDataset(data_path, max_length=max_length or 64)
+        return ClinVarDataset(data_path, max_length=max_length or 64, expanded_mech=True)
     if task == "proteomics":
         from src.dataset import MassIVEKBDataset
         return MassIVEKBDataset(data_path, max_length=max_length or 100)
@@ -161,7 +161,7 @@ def main():
         raise FileNotFoundError(
             f"Weights not found: {args.weights}\n"
             "Train first (train.py / train_siamese.py) or pass --weights.")
-    model = HoloGNN().to(device)
+    model = HoloGNN(mech_feature_dim=6, freeze_esm_layers=4, antisym_head=True).to(device)
     # strict=False so a checkpoint trained for a sibling task (e.g. the disease
     # classifier) still loads its shared backbone for evaluation.
     missing = model.load_state_dict(torch.load(args.weights, map_location=device), strict=False)

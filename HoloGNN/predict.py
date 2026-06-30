@@ -55,7 +55,7 @@ def _try_load_model():
 
     from src.device import describe_device
     device = describe_device()
-    model = HoloGNN()
+    model = HoloGNN(mech_feature_dim=6, freeze_esm_layers=4, antisym_head=True)
     try:
         model.load_state_dict(torch.load(MODEL_PATH, map_location=device))
     except Exception as exc:  # noqa: BLE001
@@ -74,7 +74,7 @@ def _make_batch(seq, tokenizer, device, torch):
     input_ids = enc["input_ids"].to(device)
     mask      = enc["attention_mask"].to(device)
     L         = input_ids.size(1)
-    mech      = mechanistic_features_for_protein(seq, L).unsqueeze(0).to(device)
+    mech      = mechanistic_features_for_protein(seq, L, expanded=True).unsqueeze(0).to(device)
 
     class DataBatch:  # lightweight attribute carrier
         pass

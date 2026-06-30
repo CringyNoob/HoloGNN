@@ -1,16 +1,11 @@
 """
 src/pooling.py
 ==============
-Mask-aware graph-level pooling for the Holo-GNN backbone (V6).
-
-The V5 backbone pooled residue embeddings with a plain ``torch.mean`` over the
-full padded length, which dilutes the signal with padding tokens (and weights
-every residue equally). V6 replaces this with:
+Mask-aware graph-level pooling for the Holo-GNN backbone.
 
   • ``AttentionPooling`` — a learned, mask-aware attention pool that computes a
-    softmax over real residues only and returns their weighted sum, OR
-  • ``masked_mean`` — a simple padding-aware mean (used when ``pool="mean"`` is
-    requested for V5 reproduction).
+    softmax over real residues only and returns their weighted sum.
+  • ``masked_mean`` — a simple padding-aware mean.
 
 Both honour the ``attention_mask`` so padding never contributes.
 """

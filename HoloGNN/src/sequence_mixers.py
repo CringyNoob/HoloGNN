@@ -1,24 +1,17 @@
 """
 src/sequence_mixers.py
 ======================
-Future-work architectural modules (paper §8.2), implemented as **optional**,
-self-contained, weight-compatible blocks that the backbone can switch on:
+Optional architectural modules for the Holo-GNN backbone:
 
-  • CrossAttentionFusion (§8.2-i)
+  • CrossAttentionFusion
         Replaces the simple geometric stacking ``cat([esm, mech])`` with explicit
         cross-modal attention between the evolutionary (ESM-2) and mechanistic
-        tracks.  It still emits a 323-dim node tensor (320 fused ESM + 3 raw
-        mechanistic channels) so the rest of the backbone is unchanged.
+        tracks.
 
-  • SelectiveSSM (§8.2-ii, "Mamba")
+  • SelectiveSSM ("Mamba")
         A linear-time state-space sequence mixer over the residue dimension.
-        If the real ``mamba_ssm`` package is installed it is used directly;
-        otherwise a dependency-free selective state-space recurrence (S6-style,
-        input-dependent gating) is used so the module runs anywhere, including
-        on CPU.  Either way the input/output shape is (B, L, D).
 
-Both default to OFF in the backbone, so existing behaviour and any existing
-checkpoints are preserved unless explicitly enabled.
+Both default to OFF in the backbone.
 """
 
 from __future__ import annotations
@@ -36,7 +29,7 @@ except Exception:  # noqa: BLE001
 
 
 # ---------------------------------------------------------------------------
-# §8.2-i  Cross-Attention Fusion
+# Cross-Attention Fusion
 # ---------------------------------------------------------------------------
 class CrossAttentionFusion(nn.Module):
     """
@@ -83,7 +76,7 @@ class CrossAttentionFusion(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# §8.2-ii  Selective State-Space mixer ("Mamba")
+# Selective State-Space mixer ("Mamba")
 # ---------------------------------------------------------------------------
 class _PureSelectiveSSM(nn.Module):
     """

@@ -1,49 +1,42 @@
 """
 src/backbone.py
 ===============
-HoloGNN Backbone — Evolution History
---------------------------------------
-V1.0  Simple linear graph fallback (i → i+1).
-V2.0  Dual-Track Dynamic Graph: edges built from ESM-2 attention map (no fallback).
-V3.0  Mechanistic Injection: mRNA_fold / CAI / Charge concatenated onto node
-      embeddings before GATConv (Prior et al. 2024).
-V5.0  Production Upgrades:
-        • GATConv → GATv2Conv  (dynamic attention; Brody et al. 2022 "How Attentive
-          are Graph Attention Networks?" ICLR 2022).  GATv2 fixes the static
-          attention bottleneck of GATv1 where e(h_i, h_j) = a·[Wh_i || Wh_j]
-          is computed before non-linearity, making it rank-1 and incapable of
-          expressing complex neighbourhood interactions.  GATv2 applies LeakyReLU
-          first: e(h_i, h_j) = a·LeakyReLU(W·[h_i || h_j]) — truly dynamic.
-        • Residual Skip Connection: raw ESM-2 node embeddings are added back to
-          the GATv2 output to prevent over-smoothing across layers.  A linear
-          projection is used to match dimensions when ESM2_DIM ≠ output_dim.
+HoloGNN Backbone — ESM-2 + GATv2Conv + Mechanistic Feature Injection.
+
+Forward pass summary:
+    1. ESM-2 (t6 8M) encodes token sequence → node embeddings  (B, L, 320).
+    2. Mechanistic features (B, L, mech_feature_dim) are concatenated.
+    3. Edge index is built from the ESM-2 attention map (per-sample or shared).
+    4. Two-layer GATv2Conv with dynamic attention refines nodes.
+    5. Residual skip connection preserves the ESM-2 identity signal.
+    6. Mask-aware pooling → graph-level embedding (B, output_dim).
 """
 
 import torch
 import torch.nn as nn
 from transformers import EsmModel
 
-# Future-work modules (§8.2) — optional, off by default.
+# Optional sequence mixers — off by default.
 from src.sequence_mixers import CrossAttentionFusion, SelectiveSSM
-# V6 modules.
+# Pooling and graph-builder modules.
 from src.pooling import AttentionPooling, masked_mean
 from src.utils.graph_builder import build_batched_attention_graph
 
 # ---------------------------------------------------------------------------
-# Optional PyG import — tries GATv2Conv first (V5.0), falls back gracefully
+# Optional PyG import — tries GATv2Conv first, falls back gracefully
 # ---------------------------------------------------------------------------
 try:
     from torch_geometric.nn import GATv2Conv
     _PYGEO_AVAILABLE = True
     _GAT_CLS         = GATv2Conv
-    print("✅ torch_geometric GATv2Conv available — V5.0 dynamic attention ENABLED.")
+    print("✅ torch_geometric GATv2Conv available — dynamic attention ENABLED.")
 except ImportError:
     try:
         # Fallback to GATConv (V3/V4 behaviour) if GATv2 not present
         from torch_geometric.nn import GATConv as GATv2Conv
         _PYGEO_AVAILABLE = True
         _GAT_CLS         = GATv2Conv
-        print("⚠️  GATv2Conv not found — falling back to GATConv (V3.0 behaviour).")
+        print("⚠️  GATv2Conv not found — falling back to GATConv.")
     except ImportError:
         print("Warning: torch_geometric not found. GNN layers will be disabled.")
         GATv2Conv        = None
@@ -55,14 +48,14 @@ except ImportError:
 # ---------------------------------------------------------------------------
 # ESM-2 t6 8M hidden dimension
 ESM2_HIDDEN_DIM  = 320
-# Three mechanistic channels (mRNA_fold, CAI, Charge) — from dataset.py V5.0
-MECH_FEATURE_DIM = 3
-# Combined input to GATv2 layers: 320 + 3 = 323
-GAT_IN_CHANNELS  = ESM2_HIDDEN_DIM + MECH_FEATURE_DIM   # 323
+# Default mechanistic channels (6: mRNA_fold, CAI, charge, hydropathy, volume, helix_propensity)
+MECH_FEATURE_DIM = 6
+# Combined input to GATv2 layers: 320 + 6 = 326
+GAT_IN_CHANNELS  = ESM2_HIDDEN_DIM + MECH_FEATURE_DIM   # 326
 
 
 # ---------------------------------------------------------------------------
-# V2.0 — Attention-based graph builder  (still used in V5.0)
+# Attention-based graph builder (shared-graph mode)
 # ---------------------------------------------------------------------------
 def build_attention_graph(avg_attention: torch.Tensor, threshold: float = 0.05) -> torch.Tensor:
     """
@@ -82,24 +75,22 @@ def build_attention_graph(avg_attention: torch.Tensor, threshold: float = 0.05) 
 
 
 # ---------------------------------------------------------------------------
-# V5.0 — Backbone
+# Backbone
 # ---------------------------------------------------------------------------
 class HoloGNNBackbone(nn.Module):
     """
-    HoloGNN Backbone — Version 5.0
+    HoloGNN Backbone.
 
     Forward pass summary:
         1. ESM-2 (t6 8M) encodes token sequence → node embeddings  (B, L, 320).
-        2. [V3.0] Mechanistic features (B, L, 3) are concatenated  → (B, L, 323).
-        3. [V2.0] Edge index is built from the ESM-2 attention map.
-        4. [V5.0] Two-layer GATv2Conv with dynamic attention refines nodes.
-        5. [V5.0] Residual skip connection: ESM-2 embeddings projected to
-                  output_dim are added back to the GATv2 output.
-        6. Mean pooling → graph-level embedding (B, output_dim).
+        2. Mechanistic features are concatenated → (B, L, 320+mech_dim).
+        3. Edge index is built from the ESM-2 attention map.
+        4. Two-layer GATv2Conv with dynamic attention refines nodes.
+        5. Residual skip connection preserves ESM-2 embeddings.
+        6. Mask-aware pooling → graph-level embedding (B, output_dim).
 
     Args:
         output_dim : Final embedding size (default 320).
-                     GATv2Conv layers compress GAT_IN_CHANNELS (323) → output_dim.
     """
 
     def __init__(self, output_dim: int = 320,
@@ -114,17 +105,15 @@ class HoloGNNBackbone(nn.Module):
         """
         Args:
             output_dim        : final embedding size (default 320).
-            fusion_mode       : "concat" (V5) or "cross_attention" (§8.2-i).
-            use_ssm           : insert a Selective-SSM / Mamba mixer (§8.2-ii).
-            pool              : [V6] "attention" (mask-aware learned pooling,
-                                default) or "mean" (padding-aware mean; "mean"
-                                also reproduces V5 when no padding is present).
-            graph_mode        : [V6] "per_sample" (each protein its own graph
+            fusion_mode       : "concat" (default) or "cross_attention".
+            use_ssm           : insert a Selective-SSM / Mamba mixer.
+            pool              : "attention" (mask-aware learned pooling,
+                                default) or "mean" (padding-aware mean).
+            graph_mode        : "per_sample" (each protein its own graph
                                 with attention-weighted edges + backbone edges,
-                                default) or "shared" (V5 batch-mean topology).
-            mech_feature_dim  : number of mechanistic channels (3 = V5 default;
-                                6 enables the expanded protein-only descriptors).
-            top_k             : [V6] neighbours per node in per-sample graphs.
+                                default) or "shared" (batch-mean topology).
+            mech_feature_dim  : number of mechanistic channels (default 6).
+            top_k             : neighbours per node in per-sample graphs.
             freeze_esm        : freeze the entire ESM-2 encoder.
             freeze_esm_layers : freeze ESM-2 embeddings + the first N encoder
                                 layers (ignored if freeze_esm is True).
@@ -144,7 +133,7 @@ class HoloGNNBackbone(nn.Module):
         self.graph_mode       = graph_mode
         self.mech_feature_dim = mech_feature_dim
         self.top_k            = top_k
-        gat_in                = ESM2_HIDDEN_DIM + mech_feature_dim   # 323 (V5) or 326
+        gat_in                = ESM2_HIDDEN_DIM + mech_feature_dim
 
         # ------------------------------------------------------------------
         # 1. ESM-2 Sequence Encoder
@@ -156,7 +145,7 @@ class HoloGNNBackbone(nn.Module):
         self._apply_esm_freezing(freeze_esm, freeze_esm_layers)
 
         # ------------------------------------------------------------------
-        # 1b. [§8.2] Optional future-work mixers (OFF by default)
+        # 1b. Optional sequence mixers (OFF by default)
         # ------------------------------------------------------------------
         self.ssm = SelectiveSSM(dim=ESM2_HIDDEN_DIM) if use_ssm else None
         self.fusion = (CrossAttentionFusion(esm_dim=ESM2_HIDDEN_DIM,
@@ -184,7 +173,7 @@ class HoloGNNBackbone(nn.Module):
         # Used only when torch_geometric is unavailable (GAT bypass).
         self.fallback_proj = nn.Linear(gat_in, output_dim)
 
-        # [V6] Mask-aware pooling head.
+        # Mask-aware pooling head.
         self.pool_layer = AttentionPooling(output_dim) if pool == "attention" else None
 
         self.layer_norm = nn.LayerNorm(output_dim)
@@ -210,7 +199,7 @@ class HoloGNNBackbone(nn.Module):
         self,
         input_ids:             torch.Tensor,
         attention_mask:        torch.Tensor,
-        mechanistic_features:  torch.Tensor,        # V3.0+: (B, L, 3)
+        mechanistic_features:  torch.Tensor,        # (B, L, mech_feature_dim)
         edge_index:            torch.Tensor | None = None,
         attention_threshold:   float = 0.05,
     ):
@@ -218,9 +207,9 @@ class HoloGNNBackbone(nn.Module):
         Args:
             input_ids            : (B, L) token ids.
             attention_mask       : (B, L) 1/0 padding mask.
-            mechanistic_features : (B, L, 3) true biophysical features (V5.0).
+            mechanistic_features : (B, L, mech_feature_dim) biophysical features.
             edge_index           : Pre-built graph edges; built dynamically if None.
-            attention_threshold  : Edge-construction cutoff (V2.0).
+            attention_threshold  : Edge-construction cutoff for shared-graph mode.
 
         Returns:
             node_embeddings : (B, L, output_dim) — per-residue representations.
@@ -236,15 +225,15 @@ class HoloGNNBackbone(nn.Module):
         L                    = esm_node_embeddings.size(1)
 
         # ------------------------------------------------------------------
-        # Step 1b  [§8.2-ii]: Optional Selective-SSM / Mamba sequence mixing
+        # Step 1b: Optional Selective-SSM / Mamba sequence mixing
         # ------------------------------------------------------------------
         if self.ssm is not None:
             esm_node_embeddings = self.ssm(esm_node_embeddings)   # (B, L, 320)
 
         # ------------------------------------------------------------------
-        # Step 2  [V3.0 / §8.2-i]: Mechanistic feature injection
-        #   "concat"          → simple geometric stacking (original V5).
-        #   "cross_attention" → cross-modal attention fusion, still → (B, L, 323).
+        # Step 2: Mechanistic feature injection
+        #   "concat"          → simple geometric stacking.
+        #   "cross_attention" → cross-modal attention fusion.
         # ------------------------------------------------------------------
         if self.fusion is not None:
             key_padding_mask = (attention_mask == 0)              # True at padding
@@ -252,14 +241,14 @@ class HoloGNNBackbone(nn.Module):
                                            key_padding_mask=key_padding_mask)
         else:
             node_embeddings = torch.cat([esm_node_embeddings, mechanistic_features], dim=-1)
-        # node_embeddings is now (B, L, 323)
+        # node_embeddings is now (B, L, ESM2_HIDDEN_DIM + mech_feature_dim)
 
         # ------------------------------------------------------------------
-        # Step 3  [V6]: Dynamic graph construction from the ESM-2 attention map.
+        # Step 3: Dynamic graph construction from the ESM-2 attention map.
         #   "per_sample" → each protein gets its own attention-weighted graph
         #                  (top-k + backbone edges); the weights become edge_attr.
-        #   "shared"     → V5 batch-mean topology, replicated per sample with
-        #                  unit edge weights (kept for backward comparison).
+        #   "shared"     → batch-mean topology, replicated per sample with
+        #                  unit edge weights.
         # ------------------------------------------------------------------
         device   = input_ids.device
         edge_attr = None
@@ -271,7 +260,7 @@ class HoloGNNBackbone(nn.Module):
                 edge_index, edge_attr = build_batched_attention_graph(
                     avg_attention, attention_mask, k=self.top_k, add_backbone=True
                 )
-            else:  # "shared" (V5)
+            else:  # "shared"
                 shared     = torch.mean(avg_attention, dim=0)      # (L, L)
                 base_ei    = build_attention_graph(shared, threshold=attention_threshold)
                 diag       = torch.arange(L, device=device)        # self-loops
@@ -304,7 +293,7 @@ class HoloGNNBackbone(nn.Module):
             x = self.fallback_proj(x_flat)                           # (B*L, output_dim)
 
         # ------------------------------------------------------------------
-        # Step 5  [V5.0]: Residual skip connection
+        # Step 5: Residual skip connection
         #
         #   Add the projected raw ESM-2 embeddings back to the GATv2 output.
         #   This prevents over-smoothing: after many rounds of neighbourhood
@@ -323,7 +312,7 @@ class HoloGNNBackbone(nn.Module):
         x = self.layer_norm(x + residual)                           # (B*L, output_dim)
 
         # ------------------------------------------------------------------
-        # Step 6  [V6]: Mask-aware pooling → graph-level embedding.
+        # Step 6: Mask-aware pooling → graph-level embedding.
         #   Padding tokens never contribute (attention pool or padding-aware mean).
         # ------------------------------------------------------------------
         x_reshaped = x.view(B, L, -1)                               # (B, L, output_dim)

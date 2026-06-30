@@ -1,11 +1,11 @@
 """
 src/loss.py
 ===========
-HoloGNN Custom Loss Functions — Version 4.0
----------------------------------------------
+HoloGNN Custom Loss Functions.
+
 AntisymmetricLoss
     Enforces the physical antisymmetry constraint of ΔΔG predictions from the
-    V4.0 Siamese forward pass.
+    Siamese forward pass.
 
     The mathematical formulation is:
 
@@ -13,31 +13,14 @@ AntisymmetricLoss
              ──────────────────────────────   ───────────────────
                   Antisymmetry Term               Fidelity Term
 
-    Term 1 — Antisymmetry Term
-    ~~~~~~~~~~~~~~~~~~~~~~~~~~
-    Physical law: the free-energy change from WT→MT is exactly equal and
-    opposite to the change from MT→WT.  In other words:
+    Term 1 — Antisymmetry Term:
+        ΔΔG(WT→MT) = −ΔΔG(MT→WT)  ⟹  ΔΔG(WT→MT) + ΔΔG(MT→WT) = 0
+        The Antisymmetry Term directly penalises deviations from this physical
+        constraint during training.
 
-        ΔΔG(WT→MT) = −ΔΔG(MT→WT)
-        ⟹  ΔΔG(WT→MT) + ΔΔG(MT→WT) = 0
-
-    The model should learn this for free because the SiameseStabilityHead
-    computes f(z_mt − z_wt), so running it in both directions should produce
-    opposite signs — but only if the learned MLP is antisymmetric at
-    convergence.  The Antisymmetry Term _directly penalises_ deviations from
-    this physical constraint during training, acting as a hard inductive bias
-    rather than hoping the network discovers it implicitly.
-
-    Term 2 — Fidelity Term
-    ~~~~~~~~~~~~~~~~~~~~~~
-    A standard MSE regression loss between the forward prediction and the
-    experimentally measured ΔΔG value.  This term ensures the model does not
-    simply predict zero for all inputs to trivially satisfy Term 1.
-
-    The two terms are naturally balanced: both are squared errors, so they
-    exist on the same numeric scale and no weighting coefficient is needed in
-    the base implementation.  An optional `alpha` argument is provided to
-    up-weight the antisymmetry term during early training if desired.
+    Term 2 — Fidelity Term:
+        Standard MSE regression loss between the forward prediction and the
+        experimentally measured ΔΔG value.
 """
 
 import torch
@@ -46,7 +29,7 @@ import torch.nn as nn
 
 class AntisymmetricLoss(nn.Module):
     """
-    Antisymmetric ΔΔG loss for the V4.0 Siamese training loop.
+    Antisymmetric ΔΔG loss for the Siamese training loop.
 
     Loss = (dG_wt_to_mt + dG_mt_to_wt)² + (dG_pred − dG_exp)²
            ─────────────────────────────   ─────────────────────
@@ -119,7 +102,7 @@ class AntisymmetricLoss(nn.Module):
 
 
 # =============================================================================
-# [V6] Calibrated-uncertainty losses
+# Calibrated-uncertainty losses
 # =============================================================================
 def gaussian_nll(mu: torch.Tensor, logvar: torch.Tensor,
                  target: torch.Tensor) -> torch.Tensor:

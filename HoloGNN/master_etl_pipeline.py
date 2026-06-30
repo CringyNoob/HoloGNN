@@ -1,13 +1,13 @@
 """
 master_etl_pipeline.py
 ======================
-Holo-GNN V5.0 — Master ETL Pipeline
--------------------------------------
+Holo-GNN Master ETL Pipeline
+-----------------------------
 Orchestrates parallel preprocessing of all raw biological datasets into
 optimised .parquet files for the PyTorch training loop.
 
 Designed for: Google Vertex AI · 16 vCPUs · 64 GB RAM
-Parallelism:  concurrent.futures.ProcessPoolExecutor (max 14 workers)
+Parallelism:  concurrent.futures.ProcessPoolExecutor
 Dataframes:   polars (lazy evaluation, arrow memory, multithreaded)
 Streaming:    manual line-by-line generators for VCF (1.7 GB) and FASTA (23 GB)
 
@@ -46,7 +46,7 @@ import polars as pl
 # ─────────────────────────────────────────────────────────────────────────────
 # CONFIGURATION
 # ─────────────────────────────────────────────────────────────────────────────
-MAX_WORKERS       = 14          # leave 2 cores for the OS
+MAX_WORKERS       = 4           # conservative default; tune for your hardware
 FASTA_CHUNK_SIZE  = 1_000_000  # flush to parquet every N sequences  (RAM guard)
 ESM2_MAX_LEN      = 1022        # ESM-2 tokeniser hard limit
 AMBIGUOUS_AA      = set("XBZJOU")  # filter out sequences containing these
@@ -175,7 +175,7 @@ def clean_fireprotdb(csv_path: Path, out_dir: Path) -> str:
 
 # Regex compiled once, reused for every row
 _CLNSIG_RE  = re.compile(r"CLNSIG=([^;]+)")
-_GENEINFO_RE = re.compile(r"GENEINFO=([^;]+)")
+
 
 def _stream_vcf(vcf_path: Path) -> Generator[dict, None, None]:
     """
@@ -595,7 +595,7 @@ def main(input_dir: str, output_dir: str) -> None:
     out      = Path(output_dir)
 
     log.info("=" * 70)
-    log.info("  Holo-GNN  Master ETL Pipeline  — V5.0")
+    log.info("  Holo-GNN  Master ETL Pipeline")
     log.info(f"  Input  : {inp}")
     log.info(f"  Output : {out}")
     log.info(f"  Workers: {MAX_WORKERS}  (of 16 vCPUs)")
@@ -705,7 +705,7 @@ def main(input_dir: str, output_dir: str) -> None:
 # ─────────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Holo-GNN V5.0 Master ETL Pipeline",
+        description="Holo-GNN Master ETL Pipeline",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument(

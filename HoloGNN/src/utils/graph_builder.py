@@ -1,8 +1,7 @@
 import torch
 
 
-# =============================================================================
-# V6 — per-sample batched graph construction with edge weights
+# Per-sample batched graph construction with edge weights
 # =============================================================================
 def build_batched_attention_graph(
     attentions: torch.Tensor,
@@ -11,15 +10,14 @@ def build_batched_attention_graph(
     add_backbone: bool = True,
 ):
     """
-    Build a SEPARATE contact graph for every sequence in the batch (V6).
+    Build a SEPARATE contact graph for every sequence in the batch.
 
-    Unlike the V5 path---which averaged the whole batch into a single shared
-    (L, L) topology---this constructs each protein's own graph from its own
-    attention map, keeps the attention weight as an edge feature, uses a stable
-    top-k neighbourhood instead of a brittle global threshold, and guarantees
-    backbone (i, i+1) connectivity. Node indices are offset by ``b * L`` so the
-    result indexes directly into the flattened ``(B*L, C)`` node tensor that the
-    GAT layers operate on (standard PyG mini-batching).
+    Constructs each protein's own graph from its own attention map, keeps the
+    attention weight as an edge feature, uses a stable top-k neighbourhood
+    instead of a brittle global threshold, and guarantees backbone (i, i+1)
+    connectivity. Node indices are offset by ``b * L`` so the result indexes
+    directly into the flattened ``(B*L, C)`` node tensor that the GAT layers
+    operate on (standard PyG mini-batching).
 
     Args:
         attentions     : (B, L, L) per-sample attention map (already head-averaged).

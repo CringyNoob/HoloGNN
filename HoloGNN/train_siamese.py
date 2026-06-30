@@ -1,11 +1,9 @@
 """
 train_siamese.py
 ================
-Flagship Siamese ΔΔG trainer (the V4/V5 production objective).
+Siamese ΔΔG trainer for the Holo-GNN stability prediction task.
 
-Unlike train.py / train_final.py — which train the single-sequence absolute-ΔG
-'stability' task on MegaScale — this script trains the **paired Siamese 'idr'
-task** with the physics-constrained AntisymmetricLoss:
+Trains the paired Siamese objective with the physics-constrained AntisymmetricLoss:
 
     L = (dG_wt_to_mt + dG_mt_to_wt)²  +  (dG_pred − dG_exp)²
         └ antisymmetry constraint ┘     └ regression fidelity ┘
@@ -15,7 +13,6 @@ master_etl_pipeline.py → fireprotdb_clean.parquet.
 
 Run:
     python train_siamese.py
-(Adjust DATA_PATH / BATCH_SIZE / EPOCHS below for your hardware.)
 """
 
 import os
@@ -25,6 +22,7 @@ import time
 import torch
 import torch.optim as optim
 from torch.utils.data import DataLoader, random_split
+from torch.cuda.amp import GradScaler, autocast
 from tqdm import tqdm
 
 from src.dataset import FireProtDataset
@@ -34,12 +32,13 @@ from src.device import describe_device
 from src.metrics import regression_metrics, format_report
 
 # --- CONFIGURATION ---
-DATA_PATH     = "data/fireprotdb/fireprotdb_clean.parquet"
+DATA_PATH     = "CLEANED_DATA/fireprotdb_clean.parquet"
 BATCH_SIZE    = 8
 LEARNING_RATE = 1e-4
 EPOCHS        = 5
 ALPHA         = 1.0          # antisymmetry-term weight
-SAVE_PATH     = "holognn_stability_final.pth"
+GRAD_CLIP     = 1.0          # max gradient norm
+SAVE_DIR      = "checkpoints"
 
 
 def _make_batch(batch, suffix, device):
@@ -50,19 +49,25 @@ def _make_batch(batch, suffix, device):
     d.input_ids            = batch[f"input_ids_{suffix}"].to(device)
     d.mask                 = batch[f"attention_mask_{suffix}"].to(device)
     d.mechanistic_features = batch[f"mechanistic_features_{suffix}"].to(device)
-    d.edge_index           = None     # build the graph dynamically from attention
+    d.edge_index           = None
     return d
 
 
 def train():
     print("--- SIAMESE ΔΔG TRAINING ---")
     device = describe_device()
+    use_amp = device.type == "cuda"
+    scaler  = GradScaler(enabled=use_amp)
 
-    model     = HoloGNN().to(device)
+    model = HoloGNN(
+        mech_feature_dim=6,
+        freeze_esm_layers=4,
+        antisym_head=True,
+    ).to(device)
     criterion = AntisymmetricLoss(alpha=ALPHA)
     optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
 
-    dataset = FireProtDataset(DATA_PATH)
+    dataset = FireProtDataset(DATA_PATH, expanded_mech=True)
     n_val   = max(1, int(0.1 * len(dataset)))
     n_train = len(dataset) - n_val
     train_ds, val_ds = random_split(dataset, [n_train, n_val])
@@ -70,6 +75,7 @@ def train():
     val_loader   = DataLoader(val_ds,   batch_size=BATCH_SIZE, num_workers=0)
     print(f"Train: {n_train:,} pairs | Val: {n_val:,} pairs")
 
+    os.makedirs(SAVE_DIR, exist_ok=True)
     start = time.time()
     for epoch in range(EPOCHS):
         model.train()
@@ -81,16 +87,21 @@ def train():
             labels  = batch["label"].to(device)
 
             optimizer.zero_grad()
-            dG_fwd, dG_rev = model((data_wt, data_mt), task="idr")
-            loss, comp = criterion(dG_fwd, dG_rev, labels)
-            loss.backward()
-            optimizer.step()
+            with autocast(device_type=device.type, enabled=use_amp):
+                dG_fwd, dG_rev = model((data_wt, data_mt), task="idr")
+                loss, comp = criterion(dG_fwd, dG_rev, labels)
+
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
+            scaler.step(optimizer)
+            scaler.update()
 
             run_loss += loss.item(); run_anti += comp["antisymmetry"]; run_fid += comp["fidelity"]
             n = bar.n + 1
             bar.set_postfix({"loss": run_loss/n, "anti": run_anti/n, "fid": run_fid/n})
 
-        # --- validation: loss + held-out ΔΔG regression metrics ---
+        # --- validation ---
         model.eval()
         val_loss = 0.0
         val_preds, val_labels = [], []
@@ -108,8 +119,15 @@ def train():
         print(format_report(regression_metrics(val_labels, val_preds),
                             f"Epoch {epoch+1} validation (ΔΔG)"))
 
-        torch.save(model.state_dict(), SAVE_PATH)
-        print(f"  checkpoint saved → {SAVE_PATH}")
+        ckpt_path = os.path.join(SAVE_DIR, f"holognn_siamese_epoch{epoch+1}.pth")
+        torch.save({
+            "epoch": epoch + 1,
+            "model_state": model.state_dict(),
+            "optimizer_state": optimizer.state_dict(),
+            "scaler_state": scaler.state_dict(),
+            "val_loss": val_loss / max(1, len(val_loader)),
+        }, ckpt_path)
+        print(f"  checkpoint saved → {ckpt_path}")
 
     print(f"--- COMPLETE in {(time.time()-start)/3600:.2f} h ---")
 

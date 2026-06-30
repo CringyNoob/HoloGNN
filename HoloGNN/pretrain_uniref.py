@@ -1,7 +1,7 @@
 """
 pretrain_uniref.py
 ==================
-Holo-GNN V5.0 — Unsupervised GATv2 Pre-Training via Masked Language Modeling
+Holo-GNN — Unsupervised GATv2 Pre-Training via Masked Language Modeling
 
 Objective
 ---------
@@ -29,7 +29,7 @@ same signal that a contact-map pre-training objective provides.
 
 After this pre-training, the GATv2 weights are saved to
   uniref_pretrained_weights.pth
-and loaded by the main V5.0 training loop via:
+and loaded by the main training loop via:
   model.backbone.load_state_dict(torch.load("uniref_pretrained_weights.pth"))
 
 Architecture during pre-training
@@ -275,7 +275,7 @@ def pretrain(
     max_length:   int   = 512,
     lr:           float = 1e-4,
     weight_decay: float = 0.01,
-    num_workers:  int   = 8,
+    num_workers:  int   = 2,
     grad_clip:    float = 1.0,
     log_interval: int   = 100,
     resume_from:  Optional[str] = None,
@@ -335,7 +335,7 @@ def pretrain(
         shuffle          = True,
         num_workers      = num_workers,
         pin_memory       = True,
-        persistent_workers = True,
+        persistent_workers = False,
         prefetch_factor  = 2,
         drop_last        = True,
     )
@@ -488,7 +488,7 @@ def pretrain(
 
     # ── Save final backbone weights only ──────────────────────────────────────
     # The MLM_Head is intentionally discarded.  Only the backbone weights are
-    # needed for the fine-tuning stage (V5.0 training loop).
+    # needed for the fine-tuning stage.
     backbone_state = model.backbone.state_dict()
     torch.save(backbone_state, output_path)
 
@@ -500,7 +500,7 @@ def pretrain(
     log.info(f"  Final avg acc   : {epoch_avg_acc:.4f}")
     log.info(f"  Backbone saved  : {output_path}")
     log.info("")
-    log.info("  Load in V5.0 training loop with:")
+    log.info("  Load in the training loop with:")
     log.info("    model.backbone.load_state_dict(")
     log.info(f"        torch.load('{output_path}', map_location=device)")
     log.info("    )")
@@ -532,7 +532,7 @@ if __name__ == "__main__":
                         help="Token sequence length. Must be ≤ 1022 (ESM-2 limit).")
     parser.add_argument("--lr",          type=float, default=1e-4)
     parser.add_argument("--weight_decay",type=float, default=0.01)
-    parser.add_argument("--num_workers", type=int,   default=8)
+    parser.add_argument("--num_workers", type=int,   default=2)
     parser.add_argument("--grad_clip",   type=float, default=1.0)
     parser.add_argument("--log_interval",type=int,   default=100,
                         help="Print metrics every N steps.")
